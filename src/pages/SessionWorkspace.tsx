@@ -25,7 +25,11 @@ import {
   Utensils,
   DollarSign,
   AlertCircle,
-  X
+  X,
+  Sliders,
+  ChevronDown,
+  ChevronUp,
+  Minus
 } from 'lucide-react';
 
 interface SessionData {
@@ -63,6 +67,8 @@ interface ItemAllocation {
   id: string;
   item_id: string;
   participant_id: string;
+  quantity: number;
+  split_type: string;
   allocated_amount: number; // in paise
 }
 
@@ -90,15 +96,24 @@ export default function SessionWorkspace() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
 
-  const [session, setSession] = useState<SessionData | null>(null);
+  const [session, setSession] = useState<SessionData | null>(() => {
+    // Instant cache retrieval to prevent reload 404
+    try {
+      const cached = sessionStorage.getItem(`splitbill_cache_sess_${sessionId}`);
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
+
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [allocations, setAllocations] = useState<ItemAllocation[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!session);
   const [error, setError] = useState<string | null>(null);
 
-  // Additional Charges state (in percentages or rupees)
-  const [taxPercent, setTaxPercent] = useState<number>(5); // default 5% GST
+  // Additional Charges state
+  const [taxPercent, setTaxPercent] = useState<number>(5);
   const [serviceChargeRupees, setServiceChargeRupees] = useState<number>(0);
   const [discountRupees, setDiscountRupees] = useState<number>(0);
 
@@ -116,73 +131,75 @@ export default function SessionWorkspace() {
   // Direct WhatsApp Phone prompt modal for a participant
   const [phonePromptParticipant, setPhonePromptParticipant] = useState<Participant | null>(null);
   const [enteredPhone, setEnteredPhone] = useState('');
-
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // New Item form state
+  // Expandable diner breakdowns
+  const [expandedDinerIds, setExpandedDinerIds] = useState<Set<string>>(new Set());
+
+  // New Item form state: Supports Shared, Portions, and Solo splits
   const [newItemName, setNewItemName] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('');
   const [newItemQty, setNewItemQty] = useState(1);
   const [newItemCategory, setNewItemCategory] = useState('Food');
-  const [newItemParticipants, setNewItemParticipants] = useState<Set<string>>(new Set());
+  
+  // Map of participantId -> quantity/portion for this dish (defaults to 1 each for selected)
+  const [dinerPortions, setDinerPortions] = useState<{ [participantId: string]: number }>({});
+  const [splitMode, setSplitMode] = useState<'SELECTED' | 'PORTIONS' | 'SOLO'>('SELECTED');
+  const [soloParticipantId, setSoloParticipantId] = useState<string>('');
   const [addingItem, setAddingItem] = useState(false);
 
-  // Load session data
+  // Edit Split on Existing Item Modal
+  const [editingSplitItem, setEditingSplitItem] = useState<Item | null>(null);
+  const [editingPortions, setEditingPortions] = useState<{ [participantId: string]: number }>({});
+
+  // Super-fast parallel query execution
   const loadSessionData = useCallback(async () => {
     if (!sessionId) return;
     try {
-      setLoading(true);
+      if (!session) setLoading(true);
       setError(null);
 
-      // 1. Fetch Session with Group details
-      const { data: sessData, error: sessErr } = await supabase
-        .from('sessions')
-        .select('*, groups(name)')
-        .eq('id', sessionId)
-        .single();
+      // Execute queries in parallel for ultra-fast performance
+      const [sessRes, partRes, itemsRes] = await Promise.all([
+        supabase.from('sessions').select('*, groups(name)').eq('id', sessionId).single(),
+        supabase.from('session_participants').select('*, group_members(id, name, phone)').eq('session_id', sessionId),
+        supabase.from('items').select('*').eq('session_id', sessionId).order('created_at', { ascending: true })
+      ]);
 
-      if (sessErr) throw sessErr;
-      setSession(sessData);
+      if (sessRes.error) throw sessRes.error;
+      setSession(sessRes.data);
+      sessionStorage.setItem(`splitbill_cache_sess_${sessionId}`, JSON.stringify(sessRes.data));
 
-      // 2. Fetch Session Participants with Member details
-      const { data: partData, error: partErr } = await supabase
-        .from('session_participants')
-        .select('*, group_members(id, name, phone)')
-        .eq('session_id', sessionId);
+      if (partRes.error) throw partRes.error;
+      setParticipants(partRes.data || []);
 
-      if (partErr) throw partErr;
-      setParticipants(partData || []);
+      if (itemsRes.error) throw itemsRes.error;
+      const itemsList = itemsRes.data || [];
+      setItems(itemsList);
 
-      // 3. Fetch Items
-      const { data: itemsData, error: itemsErr } = await supabase
-        .from('items')
-        .select('*')
-        .eq('session_id', sessionId)
-        .order('created_at', { ascending: true });
-
-      if (itemsErr) throw itemsErr;
-      setItems(itemsData || []);
-
-      // 4. Fetch Allocations
-      if (itemsData && itemsData.length > 0) {
-        const itemIds = itemsData.map((i) => i.id);
+      // Fetch allocations for items
+      if (itemsList.length > 0) {
+        const itemIds = itemsList.map((i) => i.id);
         const { data: allocData, error: allocErr } = await supabase
           .from('item_allocations')
           .select('*')
           .in('item_id', itemIds);
 
-        if (allocErr) throw allocErr;
-        setAllocations(allocData || []);
+        if (!allocErr && allocData) {
+          setAllocations(allocData);
+        }
       } else {
         setAllocations([]);
       }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'Failed to load session');
+      if (!session) {
+        setError(err.message || 'Failed to load session');
+      }
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, session]);
 
   useEffect(() => {
     loadSessionData();
@@ -227,53 +244,99 @@ export default function SessionWorkspace() {
     return Math.max(0, total);
   }, [calculatedSubtotal, calculatedTaxTotal, calculatedServiceCharge, calculatedDiscount]);
 
-  // Compute each participant's share of items and overall bill
+  // COMPREHENSIVE MATHEMATICAL BREAKDOWN:
+  // Handles multi-item, shared dishes, specific portions, and solo items accurately!
   const participantBreakdown = useMemo(() => {
     const breakdown = new Map<
       string,
       { 
         baseAmount: number; 
         totalOwed: number; 
-        dishes: { name: string; amount: number; totalDishPrice: number; splitCount: number }[] 
+        taxShare: number;
+        serviceShare: number;
+        discountShare: number;
+        dishes: { 
+          name: string; 
+          amount: number; 
+          portion: number; 
+          totalDishQty: number; 
+          totalDishPrice: number;
+          splitCount: number;
+        }[] 
       }
     >();
 
-    // Initialize
+    // Initialize all participants with 0
     for (const p of participants) {
-      breakdown.set(p.id, { baseAmount: 0, totalOwed: 0, dishes: [] });
+      breakdown.set(p.id, { 
+        baseAmount: 0, 
+        totalOwed: 0, 
+        taxShare: 0,
+        serviceShare: 0,
+        discountShare: 0,
+        dishes: [] 
+      });
     }
 
-    // Sum allocated items
+    // Allocate each dish strictly based on who consumed it and their portion
     for (const item of items) {
       const itemAllocs = allocationsByItem.get(item.id) || [];
-      if (itemAllocs.length > 0) {
-        const sharePerPerson = Math.round(item.total_price / itemAllocs.length);
-        for (const alloc of itemAllocs) {
-          const cur = breakdown.get(alloc.participant_id) || { baseAmount: 0, totalOwed: 0, dishes: [] };
-          cur.baseAmount += sharePerPerson;
-          cur.dishes.push({
-            name: item.name,
-            amount: sharePerPerson,
-            totalDishPrice: item.total_price,
-            splitCount: itemAllocs.length,
-          });
-          breakdown.set(alloc.participant_id, cur);
-        }
+      if (itemAllocs.length === 0) continue;
+
+      // Sum total portions assigned for this dish
+      const totalPortionsAssigned = itemAllocs.reduce((sum, a) => sum + (a.quantity || 1), 0);
+      if (totalPortionsAssigned <= 0) continue;
+
+      for (const alloc of itemAllocs) {
+        const pPortion = alloc.quantity || 1;
+        // Exact proportion of this dish's total price
+        const shareForThisPerson = Math.round((item.total_price * pPortion) / totalPortionsAssigned);
+
+        const cur = breakdown.get(alloc.participant_id) || { 
+          baseAmount: 0, 
+          totalOwed: 0, 
+          taxShare: 0, 
+          serviceShare: 0, 
+          discountShare: 0, 
+          dishes: [] 
+        };
+
+        cur.baseAmount += shareForThisPerson;
+        cur.dishes.push({
+          name: item.name,
+          amount: shareForThisPerson,
+          portion: pPortion,
+          totalDishQty: item.ordered_quantity,
+          totalDishPrice: item.total_price,
+          splitCount: itemAllocs.length,
+        });
+
+        breakdown.set(alloc.participant_id, cur);
       }
     }
 
-    // Distribute tax, service charge, and discount proportionally
+    // Fair proportional distribution of Taxes, Service Charge, and Discounts:
+    // Diners who consumed more pay their fair proportion of tax; diners who consumed 0 pay 0 tax!
     for (const p of participants) {
-      const cur = breakdown.get(p.id) || { baseAmount: 0, totalOwed: 0, dishes: [] };
+      const cur = breakdown.get(p.id) || { 
+        baseAmount: 0, 
+        totalOwed: 0, 
+        taxShare: 0, 
+        serviceShare: 0, 
+        discountShare: 0, 
+        dishes: [] 
+      };
+
       if (calculatedSubtotal > 0 && cur.baseAmount > 0) {
         const ratio = cur.baseAmount / calculatedSubtotal;
-        const participantTax = Math.round(calculatedTaxTotal * ratio);
-        const participantService = Math.round(calculatedServiceCharge * ratio);
-        const participantDiscount = Math.round(calculatedDiscount * ratio);
-        cur.totalOwed = Math.max(0, cur.baseAmount + participantTax + participantService - participantDiscount);
+        cur.taxShare = Math.round(calculatedTaxTotal * ratio);
+        cur.serviceShare = Math.round(calculatedServiceCharge * ratio);
+        cur.discountShare = Math.round(calculatedDiscount * ratio);
+        cur.totalOwed = Math.max(0, cur.baseAmount + cur.taxShare + cur.serviceShare - cur.discountShare);
       } else {
         cur.totalOwed = cur.baseAmount;
       }
+
       breakdown.set(p.id, cur);
     }
 
@@ -312,19 +375,28 @@ export default function SessionWorkspace() {
     const shareUrl = `${window.location.origin}/sessions/${sessionId}/view`;
 
     let msg = `Hi *${p.group_members.name}*! 🍽️\n\n`;
-    msg += `Here is your bill share for our meal at *${session?.restaurant_name || 'Restaurant'}*`;
+    msg += `Here is your bill share for *${session?.restaurant_name || 'Restaurant Bill'}*`;
     if (session?.table_number) msg += ` (${session.table_number})`;
     msg += `:\n\n`;
 
     if (info?.dishes && info.dishes.length > 0) {
-      msg += `🍔 *Items you shared:*\n`;
+      msg += `🍔 *Items you consumed:*\n`;
       info.dishes.forEach((d) => {
-        msg += `• ${d.name}${d.splitCount > 1 ? ` (shared by ${d.splitCount})` : ''}: ${formatCurrency(d.amount)}\n`;
+        const label = d.portion > 1 ? `${d.portion} portions` : (d.splitCount > 1 ? `shared` : 'solo');
+        msg += `• ${d.name} (${label}): ${formatCurrency(d.amount)}\n`;
       });
-      if (calculatedTaxTotal > 0 || calculatedServiceCharge > 0) {
-        msg += `• Taxes & fees included proportionally\n`;
+      if (info.taxShare > 0) {
+        msg += `• Proportional Tax (GST): ${formatCurrency(info.taxShare)}\n`;
+      }
+      if (info.serviceShare > 0) {
+        msg += `• Service Charge / Tip: ${formatCurrency(info.serviceShare)}\n`;
+      }
+      if (info.discountShare > 0) {
+        msg += `• Discount: -${formatCurrency(info.discountShare)}\n`;
       }
       msg += `\n`;
+    } else {
+      msg += `No dishes assigned.\n\n`;
     }
 
     msg += `💰 *Your Total to Pay: ${formatCurrency(owes)}*\n\n`;
@@ -333,7 +405,7 @@ export default function SessionWorkspace() {
     msg += `Thank you! ✨`;
 
     return msg;
-  }, [participantBreakdown, sessionId, session, calculatedTaxTotal, calculatedServiceCharge, hostUpiId]);
+  }, [participantBreakdown, sessionId, session, hostUpiId]);
 
   // Generate Full Group Summary WhatsApp message
   const getGroupWhatsAppSummaryMessage = useCallback(() => {
@@ -341,7 +413,7 @@ export default function SessionWorkspace() {
     let text = `🍽️ *SplitBill Summary - ${session?.restaurant_name || 'Bill'}*\n`;
     if (session?.table_number) text += `📍 ${session.table_number}\n`;
     text += `💰 Grand Total: ${formatCurrency(calculatedGrandTotal)}\n\n`;
-    text += `👥 *Individual Breakdown:*\n`;
+    text += `👥 *Individual Share:*\n`;
 
     for (const p of participants) {
       const owes = participantBreakdown.get(p.id)?.totalOwed || 0;
@@ -358,7 +430,6 @@ export default function SessionWorkspace() {
   const handleDirectWhatsAppSend = (p: Participant) => {
     const phone = p.group_members.phone;
     if (!phone) {
-      // Prompt user to enter phone number
       setPhonePromptParticipant(p);
       setEnteredPhone('');
       return;
@@ -386,7 +457,6 @@ export default function SessionWorkspace() {
 
       if (error) throw error;
 
-      // Update state locally
       setParticipants((prev) =>
         prev.map((item) =>
           item.id === phonePromptParticipant.id
@@ -400,23 +470,34 @@ export default function SessionWorkspace() {
       window.open(url, '_blank');
 
       setPhonePromptParticipant(null);
-      showToast(`Phone saved & WhatsApp opened for ${phonePromptParticipant.group_members.name}!`);
+      showToast(`Phone saved & WhatsApp opened!`);
     } catch (err: any) {
       alert(`Error saving phone: ${err.message}`);
     }
   };
 
-  // Open Add Item modal
+  // Open Add Item modal with smart defaults
   const handleOpenAddItem = () => {
     setNewItemName('');
     setNewItemPrice('');
     setNewItemQty(1);
     setNewItemCategory('Food');
-    setNewItemParticipants(new Set(participants.map((p) => p.id)));
+    setSplitMode('SELECTED');
+    
+    // Default: all participants selected with 1 portion
+    const initialPortions: { [id: string]: number } = {};
+    participants.forEach((p) => {
+      initialPortions[p.id] = 1;
+    });
+    setDinerPortions(initialPortions);
+
+    if (participants.length > 0) {
+      setSoloParticipantId(participants[0].id);
+    }
     setIsAddItemOpen(true);
   };
 
-  // Add Item
+  // Add Item to Bill
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newItemName.trim() || !newItemPrice || !sessionId) return;
@@ -445,15 +526,35 @@ export default function SessionWorkspace() {
 
       if (itemErr) throw itemErr;
 
-      // 2. Allocations
-      const selectedIds = Array.from(newItemParticipants);
-      const allocRows = (selectedIds.length > 0 ? selectedIds : participants.map((p) => p.id)).map((pId) => ({
-        item_id: itemData.id,
-        participant_id: pId,
-        quantity: 1,
-        split_type: 'EQUAL',
-        allocated_amount: Math.round(totalPricePaise / Math.max(1, selectedIds.length)),
-      }));
+      // 2. Prepare allocations based on selected mode
+      let allocRows: any[] = [];
+
+      if (splitMode === 'SOLO') {
+        // Entire dish assigned to one diner
+        if (soloParticipantId) {
+          allocRows = [
+            {
+              item_id: itemData.id,
+              participant_id: soloParticipantId,
+              quantity: newItemQty,
+              split_type: 'SOLO',
+              allocated_amount: totalPricePaise,
+            },
+          ];
+        }
+      } else {
+        // Shared or Portions: only diners with portion > 0
+        const activeEntries = Object.entries(dinerPortions).filter(([_, qty]) => qty > 0);
+        const totalAssignedPortions = activeEntries.reduce((sum, [_, qty]) => sum + qty, 0);
+
+        allocRows = activeEntries.map(([pId, qty]) => ({
+          item_id: itemData.id,
+          participant_id: pId,
+          quantity: qty,
+          split_type: splitMode === 'PORTIONS' ? 'PORTION' : 'EQUAL',
+          allocated_amount: Math.round((totalPricePaise * qty) / Math.max(1, totalAssignedPortions)),
+        }));
+      }
 
       if (allocRows.length > 0) {
         const { data: allocData, error: allocErr } = await supabase
@@ -475,31 +576,68 @@ export default function SessionWorkspace() {
     }
   };
 
-  // Delete Item
-  const handleDeleteItem = async (itemId: string, itemName: string) => {
-    if (!confirm(`Remove "${itemName}" from bill?`)) return;
+  // Open Edit Split modal for an existing item
+  const handleOpenEditSplit = (item: Item) => {
+    setEditingSplitItem(item);
+    const itemAllocs = allocationsByItem.get(item.id) || [];
+    const portMap: { [pId: string]: number } = {};
+
+    participants.forEach((p) => {
+      const match = itemAllocs.find((a) => a.participant_id === p.id);
+      portMap[p.id] = match ? (match.quantity || 1) : 0;
+    });
+
+    setEditingPortions(portMap);
+  };
+
+  // Save updated split on an item
+  const handleSaveEditSplit = async () => {
+    if (!editingSplitItem) return;
 
     try {
-      const { error: delErr } = await supabase.from('items').delete().eq('id', itemId);
-      if (delErr) throw delErr;
+      const activeEntries = Object.entries(editingPortions).filter(([_, qty]) => qty > 0);
+      if (activeEntries.length === 0) {
+        alert('At least one diner must be assigned to this dish.');
+        return;
+      }
 
-      setItems((prev) => prev.filter((i) => i.id !== itemId));
-      setAllocations((prev) => prev.filter((a) => a.item_id !== itemId));
-      showToast(`Removed "${itemName}"`);
+      // Delete old allocations for this item
+      await supabase.from('item_allocations').delete().eq('item_id', editingSplitItem.id);
+
+      const totalPortions = activeEntries.reduce((sum, [_, q]) => sum + q, 0);
+      const newRows = activeEntries.map(([pId, qty]) => ({
+        item_id: editingSplitItem.id,
+        participant_id: pId,
+        quantity: qty,
+        split_type: qty > 1 ? 'PORTION' : 'EQUAL',
+        allocated_amount: Math.round((editingSplitItem.total_price * qty) / totalPortions),
+      }));
+
+      const { data, error } = await supabase.from('item_allocations').insert(newRows).select();
+      if (error) throw error;
+
+      // Update state
+      setAllocations((prev) => [
+        ...prev.filter((a) => a.item_id !== editingSplitItem.id),
+        ...(data || []),
+      ]);
+
+      setEditingSplitItem(null);
+      showToast(`Split updated for ${editingSplitItem.name}!`);
     } catch (err: any) {
-      alert(`Error deleting item: ${err.message}`);
+      alert(`Error updating split: ${err.message}`);
     }
   };
 
-  // Toggle item allocation
-  const handleToggleItemAllocation = async (itemId: string, participantId: string) => {
+  // Quick toggle diner in/out of an item from the main screen
+  const handleToggleItemParticipant = async (itemId: string, participantId: string) => {
     const itemAllocs = allocationsByItem.get(itemId) || [];
     const existing = itemAllocs.find((a) => a.participant_id === participantId);
 
     try {
       if (existing) {
         if (itemAllocs.length <= 1) {
-          alert('At least one participant must be assigned to this item.');
+          alert('At least one person must remain assigned to this item.');
           return;
         }
         await supabase.from('item_allocations').delete().eq('id', existing.id);
@@ -525,7 +663,23 @@ export default function SessionWorkspace() {
         }
       }
     } catch (err: any) {
-      alert(`Failed to update split: ${err.message}`);
+      alert(err.message);
+    }
+  };
+
+  // Delete Item
+  const handleDeleteItem = async (itemId: string, itemName: string) => {
+    if (!confirm(`Remove "${itemName}" from bill?`)) return;
+
+    try {
+      const { error: delErr } = await supabase.from('items').delete().eq('id', itemId);
+      if (delErr) throw delErr;
+
+      setItems((prev) => prev.filter((i) => i.id !== itemId));
+      setAllocations((prev) => prev.filter((a) => a.item_id !== itemId));
+      showToast(`Removed "${itemName}"`);
+    } catch (err: any) {
+      alert(`Error deleting item: ${err.message}`);
     }
   };
 
@@ -572,13 +726,22 @@ export default function SessionWorkspace() {
     }
   };
 
+  const toggleDinerBreakdown = (pId: string) => {
+    setExpandedDinerIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(pId)) next.delete(pId);
+      else next.add(pId);
+      return next;
+    });
+  };
+
   if (loading) {
     return (
       <Layout>
         <div className="flex min-h-[50vh] items-center justify-center">
           <div className="flex flex-col items-center gap-3">
-            <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-            <p className="text-text-secondary font-medium">Opening bill workspace...</p>
+            <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent shadow-neu-sm" />
+            <p className="text-text-secondary font-medium text-xs">Opening bill workspace...</p>
           </div>
         </div>
       </Layout>
@@ -591,7 +754,7 @@ export default function SessionWorkspace() {
         <div className="flex flex-col items-center justify-center gap-4 rounded-3xl bg-card p-10 text-center shadow-neu-outer mt-6">
           <AlertCircle className="h-12 w-12 text-danger" />
           <h2 className="text-2xl font-bold font-display text-text-main">Session Not Found</h2>
-          <p className="text-text-secondary">{error || 'This session could not be found.'}</p>
+          <p className="text-text-secondary text-xs">{error || 'This bill session could not be found.'}</p>
           <Link to="/dashboard" className="rounded-2xl bg-primary px-6 py-3 font-semibold text-white shadow-neu-sm">
             Back to Dashboard
           </Link>
@@ -639,9 +802,9 @@ export default function SessionWorkspace() {
                   {session.status}
                 </span>
               </div>
-              <p className="text-xs sm:text-sm text-text-secondary flex items-center gap-2 mt-0.5">
+              <p className="text-xs text-text-secondary flex items-center gap-2 mt-0.5">
                 {session.table_number && <span>{session.table_number} • </span>}
-                <span>Group: {session.groups?.name || 'Dining Group'}</span>
+                <span>Group: {session.groups?.name || 'Dining'}</span>
                 <span>• {participants.length} Diners</span>
               </p>
             </div>
@@ -652,7 +815,7 @@ export default function SessionWorkspace() {
             {/* Direct WhatsApp Share Button */}
             <button
               onClick={() => setIsWhatsAppShareModalOpen(true)}
-              className="flex items-center gap-2 rounded-2xl bg-card px-4 py-3 text-sm font-bold text-success shadow-neu-sm transition-all hover:shadow-neu-inner-sm border border-success/20"
+              className="flex items-center gap-2 rounded-2xl bg-card px-4 py-3 text-sm font-bold text-success shadow-neu-sm transition-all hover:shadow-neu-inner-sm border border-success/30"
               title="Send bill directly via WhatsApp"
             >
               <WhatsAppIcon className="h-4 w-4 text-[#25D366]" />
@@ -703,7 +866,7 @@ export default function SessionWorkspace() {
               <Users className="h-3.5 w-3.5 text-primary" />
               Dining Participants ({participants.length})
             </h3>
-            <span className="text-xs text-text-secondary">Tap any diner to view QR or send WhatsApp</span>
+            <span className="text-[11px] text-text-secondary">Tap any diner to view UPI QR or WhatsApp</span>
           </div>
 
           <div className="flex gap-3 overflow-x-auto pb-2 pt-1 scrollbar-none">
@@ -748,7 +911,6 @@ export default function SessionWorkspace() {
                     </span>
                   </button>
 
-                  {/* 1-Click WhatsApp Send Button on Card */}
                   <button
                     onClick={() => handleDirectWhatsAppSend(p)}
                     className="flex items-center justify-center gap-1.5 w-full rounded-xl bg-card py-1.5 text-[11px] font-bold text-success shadow-neu-inner-sm hover:bg-success/10 transition-colors"
@@ -775,7 +937,7 @@ export default function SessionWorkspace() {
                     Bill Items ({items.length})
                   </h3>
                   <p className="text-xs text-text-secondary">
-                    Select which diner(s) shared each dish to split fairly
+                    Select exactly who ate each dish or assign portions
                   </p>
                 </div>
 
@@ -793,7 +955,7 @@ export default function SessionWorkspace() {
                   <Utensils className="h-10 w-10 text-text-secondary opacity-30 mb-2" />
                   <p className="font-bold text-text-main">No dishes added yet</p>
                   <p className="text-xs text-text-secondary max-w-sm mt-1">
-                    Add the food & drinks from your bill to begin automatic calculations.
+                    Add food & beverages from your check. You can split equally, assign portions, or assign solo dishes!
                   </p>
                   <button
                     onClick={handleOpenAddItem}
@@ -807,8 +969,7 @@ export default function SessionWorkspace() {
                   {items.map((item) => {
                     const itemAllocs = allocationsByItem.get(item.id) || [];
                     const assignedParticipantIds = new Set(itemAllocs.map((a) => a.participant_id));
-                    const splitCount = itemAllocs.length;
-                    const pricePerPerson = splitCount > 0 ? Math.round(item.total_price / splitCount) : 0;
+                    const totalPortions = itemAllocs.reduce((s, a) => s + (a.quantity || 1), 0);
 
                     return (
                       <div
@@ -829,46 +990,68 @@ export default function SessionWorkspace() {
                                 <span className="font-semibold text-primary font-display">
                                   {formatCurrency(item.total_price)}
                                 </span>
-                                {splitCount > 0 && (
-                                  <>
-                                    <span>•</span>
-                                    <span className="text-[11px] text-text-secondary">
-                                      ({formatCurrency(pricePerPerson)} / person)
-                                    </span>
-                                  </>
+                                {itemAllocs.length > 0 && (
+                                  <span className="text-[11px] text-text-secondary">
+                                    • {itemAllocs.length} {itemAllocs.length === 1 ? 'diner' : 'diners'}
+                                  </span>
                                 )}
                               </div>
                             </div>
                           </div>
 
-                          <button
-                            onClick={() => handleDeleteItem(item.id, item.name)}
-                            className="flex h-8 w-8 items-center justify-center rounded-lg text-text-secondary hover:text-danger hover:bg-danger/10 transition-colors"
-                            title="Remove dish"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </button>
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => handleOpenEditSplit(item)}
+                              className="flex items-center gap-1 rounded-xl bg-card px-2.5 py-1.5 text-xs font-semibold text-text-secondary hover:text-primary shadow-neu-sm hover:shadow-neu-inner-sm transition-all"
+                              title="Customize Portions / Split"
+                            >
+                              <Sliders className="h-3.5 w-3.5" />
+                              <span className="hidden sm:inline">Portions</span>
+                            </button>
+
+                            <button
+                              onClick={() => handleDeleteItem(item.id, item.name)}
+                              className="flex h-8 w-8 items-center justify-center rounded-lg text-text-secondary hover:text-danger hover:bg-danger/10 transition-colors"
+                              title="Remove dish"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </div>
                         </div>
 
-                        {/* Participant Selection Chips */}
+                        {/* Diner Allocation Chips (Click to toggle in/out) */}
                         <div className="flex flex-col gap-1.5 pt-2 border-t border-text-secondary/10">
-                          <span className="text-[11px] font-semibold text-text-secondary">
-                            Shared by ({splitCount}):
-                          </span>
+                          <div className="flex items-center justify-between text-[11px] text-text-secondary">
+                            <span>Consumed by (tap to toggle):</span>
+                            <span>{totalPortions} portion{totalPortions === 1 ? '' : 's'} assigned</span>
+                          </div>
+
                           <div className="flex flex-wrap gap-1.5">
                             {participants.map((p) => {
-                              const isAssigned = assignedParticipantIds.has(p.id);
+                              const alloc = itemAllocs.find((a) => a.participant_id === p.id);
+                              const isAssigned = Boolean(alloc);
+                              const portion = alloc ? (alloc.quantity || 1) : 0;
+                              const share = isAssigned && totalPortions > 0 
+                                ? Math.round((item.total_price * portion) / totalPortions) 
+                                : 0;
+
                               return (
                                 <button
                                   key={p.id}
-                                  onClick={() => handleToggleItemAllocation(item.id, p.id)}
-                                  className={`rounded-xl px-2.5 py-1 text-xs font-semibold transition-all ${
+                                  onClick={() => handleToggleItemParticipant(item.id, p.id)}
+                                  className={`rounded-xl px-2.5 py-1 text-xs font-semibold transition-all flex items-center gap-1.5 ${
                                     isAssigned
                                       ? 'bg-primary text-white shadow-neu-inner-sm'
                                       : 'bg-card text-text-secondary shadow-neu-sm hover:text-text-main'
                                   }`}
+                                  title={isAssigned ? `Paying ${formatCurrency(share)}` : 'Click to add to dish'}
                                 >
-                                  {p.group_members.name}
+                                  <span>{p.group_members.name}</span>
+                                  {isAssigned && (
+                                    <span className="text-[10px] opacity-90 font-mono">
+                                      ({portion > 1 ? `${portion}x • ` : ''}{formatCurrency(share)})
+                                    </span>
+                                  )}
                                 </button>
                               );
                             })}
@@ -930,7 +1113,7 @@ export default function SessionWorkspace() {
                 {/* Discount */}
                 <div className="flex flex-col gap-1.5">
                   <label className="text-xs font-bold text-text-secondary">
-                    Discount / Offer (₹):
+                    Discount / Promo (₹):
                   </label>
                   <input
                     type="number"
@@ -954,7 +1137,7 @@ export default function SessionWorkspace() {
             {/* Grand Total Summary Card */}
             <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-4">
               <h3 className="text-lg font-bold font-display text-text-main flex items-center justify-between">
-                <span>Bill Total</span>
+                <span>Grand Total</span>
                 <span className="text-2xl font-bold font-display text-primary">
                   {formatCurrency(calculatedGrandTotal)}
                 </span>
@@ -999,8 +1182,10 @@ export default function SessionWorkspace() {
 
               <div className="flex flex-col gap-3">
                 {participants.map((p) => {
-                  const owes = participantBreakdown.get(p.id)?.totalOwed || 0;
+                  const info = participantBreakdown.get(p.id);
+                  const owes = info?.totalOwed || 0;
                   const isPaid = p.status === 'PAID';
+                  const isExpanded = expandedDinerIds.has(p.id);
 
                   return (
                     <div
@@ -1008,7 +1193,10 @@ export default function SessionWorkspace() {
                       className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-sm"
                     >
                       <div className="flex items-center justify-between">
-                        <div>
+                        <div 
+                          className="cursor-pointer flex-1"
+                          onClick={() => toggleDinerBreakdown(p.id)}
+                        >
                           <div className="font-bold text-sm text-text-main flex items-center gap-1.5">
                             <span>{p.group_members.name}</span>
                             {p.group_members.phone && (
@@ -1016,8 +1204,13 @@ export default function SessionWorkspace() {
                                 ({p.group_members.phone})
                               </span>
                             )}
+                            {isExpanded ? (
+                              <ChevronUp className="h-3.5 w-3.5 text-text-secondary" />
+                            ) : (
+                              <ChevronDown className="h-3.5 w-3.5 text-text-secondary" />
+                            )}
                           </div>
-                          <div className="text-xs font-bold text-primary font-display">
+                          <div className="text-xs font-bold text-primary font-display mt-0.5">
                             {formatCurrency(owes)}
                           </div>
                         </div>
@@ -1055,6 +1248,36 @@ export default function SessionWorkspace() {
                           </button>
                         </div>
                       </div>
+
+                      {/* Expandable itemized breakdown showing strictly what they ate */}
+                      {isExpanded && info && (
+                        <div className="pt-2 border-t border-text-secondary/10 flex flex-col gap-1 text-[11px] animate-in fade-in">
+                          {info.dishes.length === 0 ? (
+                            <span className="text-text-secondary italic">No dishes assigned to this person.</span>
+                          ) : (
+                            info.dishes.map((d, i) => (
+                              <div key={i} className="flex justify-between text-text-secondary">
+                                <span>
+                                  {d.name} {d.portion > 1 ? `(${d.portion}x)` : (d.splitCount > 1 ? `(1/${d.splitCount})` : '')}
+                                </span>
+                                <span className="font-semibold text-text-main">{formatCurrency(d.amount)}</span>
+                              </div>
+                            ))
+                          )}
+                          {info.taxShare > 0 && (
+                            <div className="flex justify-between text-text-secondary pt-0.5 border-t border-text-secondary/5">
+                              <span>Tax share (GST):</span>
+                              <span className="font-semibold text-text-main">+{formatCurrency(info.taxShare)}</span>
+                            </div>
+                          )}
+                          {info.discountShare > 0 && (
+                            <div className="flex justify-between text-success">
+                              <span>Discount proportion:</span>
+                              <span className="font-semibold">-{formatCurrency(info.discountShare)}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1255,11 +1478,11 @@ export default function SessionWorkspace() {
           </div>
         )}
 
-        {/* Modal: Add Dish */}
+        {/* Modal: Add Dish (With Shared, Portions, and Solo Modes) */}
         {isAddItemOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
-            <div className="w-full max-w-md rounded-3xl bg-card p-6 sm:p-8 shadow-neu-outer animate-in fade-in zoom-in-95">
-              <div className="flex items-center justify-between mb-5">
+            <div className="w-full max-w-lg rounded-3xl bg-card p-6 sm:p-8 shadow-neu-outer animate-in fade-in zoom-in-95 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between mb-4">
                 <h3 className="text-xl font-bold font-display text-text-main">Add Dish / Item</h3>
                 <button
                   onClick={() => setIsAddItemOpen(false)}
@@ -1271,34 +1494,35 @@ export default function SessionWorkspace() {
 
               <form onSubmit={handleAddItem} className="flex flex-col gap-4">
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-text-secondary">Item Name</label>
+                  <label className="text-xs font-bold text-text-secondary">Item / Dish Name</label>
                   <input
                     type="text"
                     value={newItemName}
                     onChange={(e) => setNewItemName(e.target.value)}
-                    placeholder="e.g. Paneer Tikka, Veg Biryani"
+                    placeholder="e.g. Chicken Biryani, Butter Naan, Cold Coffee"
                     required
+                    autoFocus
                     className="rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none"
                   />
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-xs font-bold text-text-secondary">Price (₹)</label>
+                    <label className="text-xs font-bold text-text-secondary">Unit Price (₹)</label>
                     <input
                       type="number"
                       step="any"
                       min="0"
                       value={newItemPrice}
                       onChange={(e) => setNewItemPrice(e.target.value)}
-                      placeholder="e.g. 280"
+                      placeholder="e.g. 350"
                       required
-                      className="rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none"
+                      className="rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none font-bold text-primary"
                     />
                   </div>
 
                   <div className="flex flex-col gap-1.5">
-                    <label className="text-xs font-bold text-text-secondary">Quantity</label>
+                    <label className="text-xs font-bold text-text-secondary">Total Quantity</label>
                     <input
                       type="number"
                       min="1"
@@ -1309,48 +1533,169 @@ export default function SessionWorkspace() {
                   </div>
                 </div>
 
-                {/* Who Shared this Item? */}
-                <div className="flex flex-col gap-2 pt-2">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-bold text-text-secondary">
-                      Who is sharing this? ({newItemParticipants.size}/{participants.length})
-                    </label>
+                {/* Split Mode Selector */}
+                <div className="flex flex-col gap-2 pt-2 border-t border-text-secondary/10">
+                  <label className="text-xs font-bold text-text-secondary uppercase tracking-wider">
+                    How was this dish consumed?
+                  </label>
+
+                  <div className="grid grid-cols-3 gap-2">
                     <button
                       type="button"
-                      onClick={() => setNewItemParticipants(new Set(participants.map((p) => p.id)))}
-                      className="text-[11px] font-semibold text-primary hover:underline"
+                      onClick={() => setSplitMode('SELECTED')}
+                      className={`rounded-xl py-2 px-2 text-xs font-bold transition-all ${
+                        splitMode === 'SELECTED'
+                          ? 'bg-primary text-white shadow-neu-sm'
+                          : 'bg-card text-text-secondary shadow-neu-sm hover:text-text-main'
+                      }`}
                     >
-                      Select All
+                      Shared by People
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setSplitMode('PORTIONS')}
+                      className={`rounded-xl py-2 px-2 text-xs font-bold transition-all ${
+                        splitMode === 'PORTIONS'
+                          ? 'bg-primary text-white shadow-neu-sm'
+                          : 'bg-card text-text-secondary shadow-neu-sm hover:text-text-main'
+                      }`}
+                    >
+                      By Portions / Qty
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setSplitMode('SOLO')}
+                      className={`rounded-xl py-2 px-2 text-xs font-bold transition-all ${
+                        splitMode === 'SOLO'
+                          ? 'bg-primary text-white shadow-neu-sm'
+                          : 'bg-card text-text-secondary shadow-neu-sm hover:text-text-main'
+                      }`}
+                    >
+                      Only 1 Person
                     </button>
                   </div>
+                </div>
 
-                  <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto p-1">
-                    {participants.map((p) => {
-                      const isSelected = newItemParticipants.has(p.id);
-                      return (
+                {/* Mode 1: Shared by Selected People */}
+                {splitMode === 'SELECTED' && (
+                  <div className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-inner">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-text-secondary">
+                        Select who ate this (unselected diners pay ₹0):
+                      </span>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const all: { [id: string]: number } = {};
+                            participants.forEach((p) => { all[p.id] = 1; });
+                            setDinerPortions(all);
+                          }}
+                          className="text-primary hover:underline text-[11px]"
+                        >
+                          All
+                        </button>
+                        <span>•</span>
+                        <button
+                          type="button"
+                          onClick={() => setDinerPortions({})}
+                          className="text-text-secondary hover:underline text-[11px]"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {participants.map((p) => {
+                        const isSelected = (dinerPortions[p.id] || 0) > 0;
+                        return (
+                          <button
+                            type="button"
+                            key={p.id}
+                            onClick={() => {
+                              setDinerPortions((prev) => ({
+                                ...prev,
+                                [p.id]: isSelected ? 0 : 1,
+                              }));
+                            }}
+                            className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition-all ${
+                              isSelected
+                                ? 'bg-primary text-white shadow-neu-inner-sm'
+                                : 'bg-card text-text-secondary shadow-neu-sm hover:text-text-main'
+                            }`}
+                          >
+                            {p.group_members.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Mode 2: By Portions / Quantities */}
+                {splitMode === 'PORTIONS' && (
+                  <div className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-inner max-h-52 overflow-y-auto">
+                    <span className="text-xs font-bold text-text-secondary">
+                      Specify exact portions eaten by each person:
+                    </span>
+
+                    <div className="flex flex-col gap-2 pt-1">
+                      {participants.map((p) => {
+                        const qty = dinerPortions[p.id] || 0;
+                        return (
+                          <div key={p.id} className="flex items-center justify-between text-xs bg-card p-2 rounded-xl shadow-neu-sm">
+                            <span className="font-semibold text-text-main">{p.group_members.name}</span>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setDinerPortions((prev) => ({ ...prev, [p.id]: Math.max(0, qty - 1) }))}
+                                className="h-6 w-6 rounded-lg bg-card shadow-neu-sm hover:shadow-neu-inner-sm flex items-center justify-center font-bold"
+                              >
+                                -
+                              </button>
+                              <span className="font-bold text-sm text-primary w-6 text-center">{qty}</span>
+                              <button
+                                type="button"
+                                onClick={() => setDinerPortions((prev) => ({ ...prev, [p.id]: qty + 1 }))}
+                                className="h-6 w-6 rounded-lg bg-card shadow-neu-sm hover:shadow-neu-inner-sm flex items-center justify-center font-bold"
+                              >
+                                +
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Mode 3: Solo / 1 Diner */}
+                {splitMode === 'SOLO' && (
+                  <div className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-inner">
+                    <span className="text-xs font-bold text-text-secondary">
+                      Select the single diner who had this:
+                    </span>
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      {participants.map((p) => (
                         <button
                           type="button"
                           key={p.id}
-                          onClick={() => {
-                            setNewItemParticipants((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(p.id)) next.delete(p.id);
-                              else next.add(p.id);
-                              return next;
-                            });
-                          }}
-                          className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition-all ${
-                            isSelected
+                          onClick={() => setSoloParticipantId(p.id)}
+                          className={`rounded-xl p-2.5 text-xs font-semibold transition-all text-left truncate ${
+                            soloParticipantId === p.id
                               ? 'bg-primary text-white shadow-neu-inner-sm'
                               : 'bg-card text-text-secondary shadow-neu-sm'
                           }`}
                         >
                           {p.group_members.name}
                         </button>
-                      );
-                    })}
+                      ))}
+                    </div>
                   </div>
-                </div>
+                )}
 
                 <button
                   type="submit"
@@ -1360,6 +1705,82 @@ export default function SessionWorkspace() {
                   {addingItem ? 'Adding Dish...' : 'Add to Bill'}
                 </button>
               </form>
+            </div>
+          </div>
+        )}
+
+        {/* Modal: Edit Split on an Existing Dish */}
+        {editingSplitItem && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-md rounded-3xl bg-card p-6 sm:p-8 shadow-neu-outer animate-in fade-in zoom-in-95 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-lg font-bold font-display text-text-main">
+                    Edit Split: {editingSplitItem.name}
+                  </h3>
+                  <p className="text-xs text-text-secondary">
+                    Total: {formatCurrency(editingSplitItem.total_price)}
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => setEditingSplitItem(null)}
+                  className="flex h-8 w-8 items-center justify-center rounded-xl bg-card text-text-secondary hover:text-text-main shadow-neu-sm"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="flex flex-col gap-2.5">
+                <span className="text-xs font-bold text-text-secondary">
+                  Assign portions / consumption for each person:
+                </span>
+
+                <div className="flex flex-col gap-2 max-h-60 overflow-y-auto pr-1">
+                  {participants.map((p) => {
+                    const qty = editingPortions[p.id] || 0;
+                    return (
+                      <div key={p.id} className="flex items-center justify-between text-xs bg-card p-3 rounded-2xl shadow-neu-sm">
+                        <span className="font-bold text-text-main">{p.group_members.name}</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setEditingPortions((prev) => ({ ...prev, [p.id]: Math.max(0, qty - 1) }))}
+                            className="h-7 w-7 rounded-lg bg-card shadow-neu-sm hover:shadow-neu-inner-sm flex items-center justify-center font-bold"
+                          >
+                            <Minus className="h-3 w-3" />
+                          </button>
+                          <span className="font-bold text-sm text-primary w-6 text-center">{qty}</span>
+                          <button
+                            type="button"
+                            onClick={() => setEditingPortions((prev) => ({ ...prev, [p.id]: qty + 1 }))}
+                            className="h-7 w-7 rounded-lg bg-card shadow-neu-sm hover:shadow-neu-inner-sm flex items-center justify-center font-bold"
+                          >
+                            <Plus className="h-3 w-3" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="flex items-center gap-2 pt-3">
+                  <button
+                    type="button"
+                    onClick={() => setEditingSplitItem(null)}
+                    className="flex-1 rounded-2xl bg-card py-3 text-xs font-semibold text-text-secondary shadow-neu-sm"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveEditSplit}
+                    className="flex-1 rounded-2xl bg-primary py-3 text-xs font-bold text-white shadow-neu-sm hover:bg-primary-hover"
+                  >
+                    Save Split
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1470,7 +1891,6 @@ export default function SessionWorkspace() {
                         Open UPI App
                       </a>
 
-                      {/* WhatsApp share from this modal */}
                       <button
                         onClick={() => {
                           handleDirectWhatsAppSend(activePaymentParticipant);

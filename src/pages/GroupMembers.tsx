@@ -11,13 +11,15 @@ import {
   Receipt, 
   Play, 
   Utensils, 
-  Calendar,
+  Calendar, 
   AlertCircle,
   CheckCircle2,
   Phone,
   Edit2,
   Check,
-  X
+  X,
+  BookOpen,
+  Plus
 } from 'lucide-react';
 
 interface Group {
@@ -66,12 +68,25 @@ export default function GroupMembers() {
   const [memberName, setMemberName] = useState('');
   const [memberPhone, setMemberPhone] = useState('');
   const [addingMember, setAddingMember] = useState(false);
-  const [startingSession, setStartingSession] = useState(false);
   const [notification, setNotification] = useState<string | null>(null);
+
+  // Frequent dining friends across other groups for fast 1-click addition
+  const [frequentFriends, setFrequentFriends] = useState<{ name: string; phone: string | null }[]>([]);
 
   // Inline editing of phone number
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
   const [editingPhoneValue, setEditingPhoneValue] = useState('');
+
+  // Start Session with Session Name Modal
+  const [isStartSessionModalOpen, setIsStartSessionModalOpen] = useState(false);
+  const [sessionName, setSessionName] = useState('');
+  const [sessionRestaurant, setSessionRestaurant] = useState('');
+  const [sessionTable, setSessionTable] = useState('');
+  const [selectedAttendeeIds, setSelectedAttendeeIds] = useState<Set<string>>(new Set());
+  const [startingSession, setStartingSession] = useState(false);
+
+  // Check if browser supports Contact Picker API
+  const isContactPickerSupported = typeof navigator !== 'undefined' && 'contacts' in navigator && 'ContactsManager' in window;
 
   const fetchGroupDetails = useCallback(async () => {
     if (!groupId) return;
@@ -97,7 +112,9 @@ export default function GroupMembers() {
         .order('created_at', { ascending: true });
 
       if (membersError) throw membersError;
-      setMembers(membersData || []);
+      const mems = membersData || [];
+      setMembers(mems);
+      setSelectedAttendeeIds(new Set(mems.map((m) => m.id)));
 
       // Fetch past sessions for this group
       const { data: sessionsData, error: sessionsError } = await supabase
@@ -108,6 +125,32 @@ export default function GroupMembers() {
 
       if (sessionsError) throw sessionsError;
       setSessions(sessionsData || []);
+
+      // Pull other frequent friends across groups to enable 1-click add
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const { data: allMembersData } = await supabase
+          .from('group_members')
+          .select('name, phone')
+          .neq('group_id', groupId)
+          .limit(20);
+
+        if (allMembersData) {
+          // Deduplicate
+          const currentNames = new Set(mems.map((m) => m.name.toLowerCase()));
+          const unique: { name: string; phone: string | null }[] = [];
+          const seen = new Set<string>();
+
+          for (const item of allMembersData) {
+            const key = item.name.toLowerCase();
+            if (!currentNames.has(key) && !seen.has(key)) {
+              seen.add(key);
+              unique.push(item);
+            }
+          }
+          setFrequentFriends(unique.slice(0, 6));
+        }
+      }
     } catch (err: any) {
       console.error('Error fetching group details:', err);
       setError(err.message || 'Failed to load group details.');
@@ -119,6 +162,38 @@ export default function GroupMembers() {
   useEffect(() => {
     fetchGroupDetails();
   }, [fetchGroupDetails]);
+
+  // Direct Phone Contacts Picker
+  const handleSelectFromPhoneContacts = async () => {
+    if (!isContactPickerSupported) {
+      alert('Contact Picker API is supported in mobile Chrome/Safari. On desktop, please use the input below or select from frequent friends!');
+      return;
+    }
+
+    try {
+      const contacts = await (navigator as any).contacts.select(['name', 'tel'], { multiple: true });
+      if (contacts && contacts.length > 0) {
+        const rowsToAdd = contacts.map((c: any) => ({
+          group_id: groupId,
+          name: (c.name && c.name[0]) ? c.name[0] : 'Contact',
+          phone: (c.tel && c.tel[0]) ? c.tel[0].replace(/\D/g, '') : null,
+          status: 'JOINED',
+        }));
+
+        const { data, error } = await supabase.from('group_members').insert(rowsToAdd).select();
+        if (error) throw error;
+        if (data) {
+          setMembers((prev) => [...prev, ...data]);
+          showNotification(`Added ${data.length} contact(s) directly from phone! 📱`);
+        }
+      }
+    } catch (err: any) {
+      // User cancelled picker or error
+      if (err.name !== 'AbortError') {
+        console.warn('Contacts selection error:', err);
+      }
+    }
+  };
 
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -143,14 +218,43 @@ export default function GroupMembers() {
 
       if (data) {
         setMembers((prev) => [...prev, data]);
+        setSelectedAttendeeIds((prev) => new Set([...prev, data.id]));
         setMemberName('');
         setMemberPhone('');
-        showNotification(`${data.name} added to the group!`);
+        showNotification(`${data.name} added to group!`);
       }
     } catch (err: any) {
       alert(`Error adding member: ${err.message}`);
     } finally {
       setAddingMember(false);
+    }
+  };
+
+  const handleAddFrequentFriend = async (friend: { name: string; phone: string | null }) => {
+    if (!groupId) return;
+    try {
+      const { data, error } = await supabase
+        .from('group_members')
+        .insert([
+          {
+            group_id: groupId,
+            name: friend.name,
+            phone: friend.phone,
+            status: 'JOINED',
+          },
+        ])
+        .select()
+        .single();
+
+      if (error) throw error;
+      if (data) {
+        setMembers((prev) => [...prev, data]);
+        setSelectedAttendeeIds((prev) => new Set([...prev, data.id]));
+        setFrequentFriends((prev) => prev.filter((f) => f.name !== friend.name));
+        showNotification(`${data.name} added!`);
+      }
+    } catch (err: any) {
+      alert(err.message);
     }
   };
 
@@ -198,16 +302,30 @@ export default function GroupMembers() {
     window.open(url, '_blank');
   };
 
-  const handleStartSession = async () => {
-    if (!group) return;
-    setStartingSession(true);
+  // Open modal asking for Session Name
+  const handleOpenStartSessionModal = () => {
+    setSessionName('');
+    setSessionRestaurant(group?.restaurant_name || '');
+    setSessionTable('');
+    setSelectedAttendeeIds(new Set(members.map((m) => m.id)));
+    setIsStartSessionModalOpen(true);
+  };
 
+  const handleLaunchSession = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!group) return;
+
+    setStartingSession(true);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
         navigate('/login');
         return;
       }
+
+      const finalTitle = sessionName.trim()
+        ? (sessionRestaurant.trim() ? `${sessionName.trim()} @ ${sessionRestaurant.trim()}` : sessionName.trim())
+        : (sessionRestaurant.trim() || group.name);
 
       // Create new session for this group
       const { data: newSession, error: sessionError } = await supabase
@@ -216,7 +334,8 @@ export default function GroupMembers() {
           {
             group_id: group.id,
             host_id: user.id,
-            restaurant_name: group.restaurant_name || group.name,
+            restaurant_name: finalTitle,
+            table_number: sessionTable.trim() || null,
             currency: 'INR',
             status: 'DRAFT',
             subtotal: 0,
@@ -228,9 +347,10 @@ export default function GroupMembers() {
 
       if (sessionError) throw sessionError;
 
-      // Add all group members as participants in this session
-      if (members.length > 0) {
-        const participantRows = members.map((m) => ({
+      // Add selected attendees as participants
+      const attendeeList = members.filter((m) => selectedAttendeeIds.has(m.id));
+      if (attendeeList.length > 0) {
+        const participantRows = attendeeList.map((m) => ({
           session_id: newSession.id,
           group_member_id: m.id,
           status: 'JOINED',
@@ -257,8 +377,8 @@ export default function GroupMembers() {
       <Layout>
         <div className="flex min-h-[50vh] items-center justify-center">
           <div className="flex flex-col items-center gap-3">
-            <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-            <p className="text-text-secondary font-medium">Loading group details...</p>
+            <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent shadow-neu-sm" />
+            <p className="text-text-secondary font-medium text-xs">Loading group details...</p>
           </div>
         </div>
       </Layout>
@@ -271,10 +391,10 @@ export default function GroupMembers() {
         <div className="flex flex-col items-center justify-center gap-4 rounded-3xl bg-card p-10 text-center shadow-neu-outer mt-6">
           <AlertCircle className="h-12 w-12 text-danger" />
           <h2 className="text-2xl font-bold font-display text-text-main">Group Not Found</h2>
-          <p className="text-text-secondary max-w-md">{error || 'This group may have been deleted or you do not have permission to view it.'}</p>
+          <p className="text-text-secondary max-w-md">{error || 'This group may have been deleted.'}</p>
           <Link
             to="/dashboard"
-            className="mt-2 rounded-2xl bg-primary px-6 py-3 font-semibold text-white shadow-neu-sm transition-all hover:bg-primary-hover"
+            className="mt-2 rounded-2xl bg-primary px-6 py-3 font-semibold text-white shadow-neu-sm"
           >
             Back to Dashboard
           </Link>
@@ -285,7 +405,7 @@ export default function GroupMembers() {
 
   return (
     <Layout>
-      <div className="flex flex-col gap-6 pt-2">
+      <div className="flex flex-col gap-6 pt-2 pb-16">
         {/* Toast Alert */}
         {notification && (
           <div className="fixed top-20 right-6 z-50 flex items-center gap-2 rounded-2xl bg-card px-5 py-3 text-sm font-semibold text-success shadow-neu-outer border border-success/20 animate-bounce">
@@ -304,11 +424,13 @@ export default function GroupMembers() {
               <ArrowLeft className="h-5 w-5" />
             </button>
             <div>
-              <h2 className="text-2xl sm:text-3xl font-bold font-display text-text-main">
-                {group.name}
-              </h2>
+              <div className="flex items-center gap-2.5">
+                <h2 className="text-2xl sm:text-3xl font-bold font-display text-text-main">
+                  {group.name}
+                </h2>
+              </div>
               {group.restaurant_name && (
-                <p className="flex items-center gap-1.5 text-sm text-text-secondary">
+                <p className="flex items-center gap-1.5 text-xs text-text-secondary mt-0.5">
                   <Utensils className="h-3.5 w-3.5 text-primary" />
                   {group.restaurant_name}
                 </p>
@@ -316,24 +438,23 @@ export default function GroupMembers() {
             </div>
           </div>
 
-          {/* Quick Start Session Button */}
+          {/* Quick Start Session Button (Triggers Session Name Dialog) */}
           <button
-            onClick={handleStartSession}
-            disabled={startingSession}
-            className="flex items-center gap-2 rounded-2xl bg-primary px-6 py-3.5 text-base font-semibold text-white shadow-neu-sm transition-all hover:bg-primary-hover hover:shadow-neu-inner-sm disabled:opacity-60"
+            onClick={handleOpenStartSessionModal}
+            className="flex items-center gap-2 rounded-2xl bg-primary px-6 py-3.5 text-sm font-bold text-white shadow-neu-sm transition-all hover:bg-primary-hover hover:shadow-neu-inner-sm"
           >
-            <Play className="h-5 w-5 fill-current" />
-            {startingSession ? 'Launching...' : 'Start Bill Session'}
+            <Play className="h-4 w-4 fill-current" />
+            Start Bill Session
           </button>
         </div>
 
         {/* Members Management Section */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           
-          {/* Left Column: Member List */}
-          <div className="lg:col-span-2 flex flex-col gap-4">
+          {/* Left Column: Member List & Past Bills */}
+          <div className="lg:col-span-2 flex flex-col gap-5">
             <div className="rounded-3xl bg-card p-6 shadow-neu-outer">
-              <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2.5">
                   <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary/10 text-primary">
                     <Users className="h-5 w-5" />
@@ -343,10 +464,21 @@ export default function GroupMembers() {
                       Group Members ({members.length})
                     </h3>
                     <p className="text-xs text-text-secondary">
-                      Members can receive bill links directly to their WhatsApp
+                      Diners who will participate in this group's bills
                     </p>
                   </div>
                 </div>
+
+                {/* Direct Contacts Button for Mobile Browsers */}
+                {isContactPickerSupported && (
+                  <button
+                    onClick={handleSelectFromPhoneContacts}
+                    className="flex items-center gap-1.5 rounded-xl bg-success/15 px-3 py-1.5 text-xs font-bold text-success hover:bg-success/25 transition-colors"
+                  >
+                    <BookOpen className="h-3.5 w-3.5" />
+                    <span>Choose from Contacts</span>
+                  </button>
+                )}
               </div>
 
               {/* Members List */}
@@ -354,8 +486,8 @@ export default function GroupMembers() {
                 <div className="flex flex-col items-center justify-center rounded-2xl bg-card p-8 text-center shadow-neu-inner">
                   <Users className="h-10 w-10 text-text-secondary opacity-40 mb-2" />
                   <p className="font-semibold text-text-main">No members yet</p>
-                  <p className="text-sm text-text-secondary">
-                    Add friends with their WhatsApp numbers below to split bills with them!
+                  <p className="text-xs text-text-secondary">
+                    Add friends below or pick directly from your phone contacts!
                   </p>
                 </div>
               ) : (
@@ -366,7 +498,7 @@ export default function GroupMembers() {
                       className="flex items-center justify-between rounded-2xl bg-card p-3.5 px-4 shadow-neu-sm transition-all hover:shadow-neu-inner-sm"
                     >
                       <div className="flex items-center gap-3">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/40 font-bold text-primary font-display">
+                        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/40 font-bold text-primary font-brand text-xl">
                           {member.name.charAt(0).toUpperCase()}
                         </div>
                         <div>
@@ -374,7 +506,7 @@ export default function GroupMembers() {
                             <span>{member.name}</span>
                             {index === 0 && (
                               <span className="rounded-lg bg-primary/15 px-2 py-0.5 text-[10px] font-bold text-primary">
-                                Host / Initial
+                                Initial
                               </span>
                             )}
                           </div>
@@ -441,7 +573,7 @@ export default function GroupMembers() {
                                   className="flex items-center gap-1 text-[11px] font-semibold text-primary hover:underline"
                                 >
                                   <Phone className="h-3 w-3" />
-                                  + Add WhatsApp Phone
+                                  + Add Phone
                                 </button>
                               )}
                             </div>
@@ -468,15 +600,15 @@ export default function GroupMembers() {
                 <div className="flex items-center gap-2">
                   <Receipt className="h-5 w-5 text-primary" />
                   <h3 className="text-lg font-bold font-display text-text-main">
-                    Group Sessions ({sessions.length})
+                    Group Bills ({sessions.length})
                   </h3>
                 </div>
               </div>
 
               {sessions.length === 0 ? (
                 <div className="rounded-2xl bg-card p-6 text-center shadow-neu-inner">
-                  <p className="text-sm text-text-secondary">
-                    No bills split for this group yet. Click <strong>Start Bill Session</strong> above to begin!
+                  <p className="text-xs text-text-secondary">
+                    No bills split for this group yet. Tap <strong>Start Bill Session</strong> above to begin!
                   </p>
                 </div>
               ) : (
@@ -492,7 +624,7 @@ export default function GroupMembers() {
                           <Receipt className="h-5 w-5" />
                         </div>
                         <div>
-                          <div className="font-semibold text-text-main">
+                          <div className="font-semibold text-text-main text-sm">
                             {sess.restaurant_name || 'Restaurant Bill'}
                           </div>
                           <div className="flex items-center gap-2 text-xs text-text-secondary">
@@ -501,7 +633,7 @@ export default function GroupMembers() {
                               {new Date(sess.created_at).toLocaleDateString()}
                             </span>
                             <span>•</span>
-                            <span className="font-semibold text-primary">
+                            <span className="font-semibold text-primary font-display">
                               {formatCurrency(sess.grand_total)}
                             </span>
                           </div>
@@ -526,41 +658,78 @@ export default function GroupMembers() {
             </div>
           </div>
 
-          {/* Right Column: Add Member Form & Quick Tips */}
-          <div className="flex flex-col gap-6">
-            <div className="rounded-3xl bg-card p-6 shadow-neu-outer">
-              <h3 className="text-lg font-bold font-display text-text-main mb-2">
-                Add New Member
+          {/* Right Column: Add Member Form (Contacts + Manual) */}
+          <div className="flex flex-col gap-5">
+            <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-4">
+              <h3 className="text-lg font-bold font-display text-text-main">
+                Add Member
               </h3>
-              <p className="text-xs text-text-secondary mb-4">
-                Include their WhatsApp phone number so you can send their bill breakdown directly.
-              </p>
 
-              <form onSubmit={handleAddMember} className="flex flex-col gap-4">
+              {/* Option 1: Native Phone Contacts Picker (if on supported device) */}
+              {isContactPickerSupported && (
+                <button
+                  type="button"
+                  onClick={handleSelectFromPhoneContacts}
+                  className="flex items-center justify-center gap-2 rounded-2xl bg-card py-3 px-4 text-xs font-bold text-success shadow-neu-sm hover:shadow-neu-inner-sm transition-all border border-success/30"
+                >
+                  <BookOpen className="h-4 w-4 text-success" />
+                  <span>Choose from Phone Contacts</span>
+                </button>
+              )}
+
+              {/* Option 2: Frequent Friends Quick-Add Chips */}
+              {frequentFriends.length > 0 && (
                 <div className="flex flex-col gap-1.5">
+                  <span className="text-[11px] font-bold text-text-secondary uppercase tracking-wider">
+                    Recent Dining Friends:
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {frequentFriends.map((f, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => handleAddFrequentFriend(f)}
+                        className="flex items-center gap-1 rounded-xl bg-card px-2.5 py-1 text-xs font-semibold text-text-main shadow-neu-sm hover:text-primary hover:shadow-neu-inner-sm"
+                        title={f.phone || ''}
+                      >
+                        <Plus className="h-3 w-3 text-primary" />
+                        <span>{f.name}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Option 3: Manual Input Form */}
+              <form onSubmit={handleAddMember} className="flex flex-col gap-3 pt-1 border-t border-text-secondary/10">
+                <span className="text-[11px] font-bold text-text-secondary uppercase tracking-wider">
+                  Or Type Manually:
+                </span>
+
+                <div className="flex flex-col gap-1">
                   <label className="text-xs font-semibold text-text-secondary">
-                    Full Name <span className="text-danger">*</span>
+                    Friend's Name <span className="text-danger">*</span>
                   </label>
                   <input
                     type="text"
                     value={memberName}
                     onChange={(e) => setMemberName(e.target.value)}
-                    placeholder="e.g. Rahul, Priya, Alex"
+                    placeholder="e.g. Rahul, Sneha, Alex"
                     required
-                    className="rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none transition-all focus:shadow-neu-inner-sm"
+                    className="rounded-2xl border-none bg-card p-3 text-xs shadow-neu-inner outline-none transition-all focus:shadow-neu-inner-sm"
                   />
                 </div>
 
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1">
                   <label className="text-xs font-semibold text-text-secondary flex items-center justify-between">
                     <span className="flex items-center gap-1">
-                      <WhatsAppIcon className="h-3.5 w-3.5 text-[#25D366]" />
-                      WhatsApp Phone Number
+                      <WhatsAppIcon className="h-3 w-3 text-[#25D366]" />
+                      WhatsApp Number
                     </span>
-                    <span className="text-[10px] text-text-secondary opacity-70">Optional</span>
+                    <span className="text-[10px] text-text-secondary opacity-60">Optional</span>
                   </label>
                   <div className="flex items-center gap-2">
-                    <span className="rounded-2xl bg-card px-3 py-3.5 text-xs font-bold text-text-secondary shadow-neu-inner">
+                    <span className="rounded-xl bg-card px-2.5 py-2.5 text-xs font-bold text-text-secondary shadow-neu-inner">
                       +91
                     </span>
                     <input
@@ -568,18 +737,15 @@ export default function GroupMembers() {
                       value={memberPhone}
                       onChange={(e) => setMemberPhone(e.target.value)}
                       placeholder="98765 43210"
-                      className="flex-1 rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none transition-all focus:shadow-neu-inner-sm font-sans"
+                      className="flex-1 rounded-2xl border-none bg-card p-3 text-xs shadow-neu-inner outline-none font-sans"
                     />
                   </div>
-                  <p className="text-[10px] text-text-secondary">
-                    Used to directly send individual bill links & UPI requests on WhatsApp.
-                  </p>
                 </div>
 
                 <button
                   type="submit"
                   disabled={addingMember || !memberName.trim()}
-                  className="flex items-center justify-center gap-2 rounded-2xl bg-card py-3.5 text-sm font-semibold text-text-main shadow-neu-sm transition-all hover:text-primary hover:shadow-neu-inner-sm disabled:opacity-50 mt-1"
+                  className="flex items-center justify-center gap-1.5 rounded-2xl bg-card py-3 text-xs font-bold text-text-main shadow-neu-sm hover:text-primary hover:shadow-neu-inner-sm disabled:opacity-50 mt-1"
                 >
                   <UserPlus className="h-4 w-4" />
                   {addingMember ? 'Adding...' : 'Add to Group'}
@@ -588,18 +754,152 @@ export default function GroupMembers() {
             </div>
 
             {/* Quick Share / How it works Card */}
-            <div className="rounded-3xl bg-card p-6 shadow-neu-inner text-sm flex flex-col gap-3">
-              <h4 className="font-bold text-text-main font-display flex items-center gap-2">
-                <WhatsAppIcon className="h-4 w-4 text-[#25D366]" />
-                Direct WhatsApp Delivery
+            <div className="rounded-3xl bg-card p-5 shadow-neu-inner text-xs flex flex-col gap-2">
+              <h4 className="font-bold text-text-main font-display flex items-center gap-1.5">
+                <span className="font-brand text-lg text-primary">SplitBill</span> Tip
               </h4>
-              <p className="text-xs text-text-secondary leading-relaxed">
-                When you split a bill in any session, SplitBill generates a direct WhatsApp link for each friend with their exact portion of food, tax, and an instant UPI payment link.
+              <p className="text-text-secondary leading-relaxed">
+                Add your friends once. When you start bill sessions, you can pick who attended and assign dishes individually so everyone pays only for what they had.
               </p>
             </div>
           </div>
 
         </div>
+
+        {/* Modal: Ask for Session Name when Starting Session */}
+        {isStartSessionModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-md rounded-3xl bg-card p-6 sm:p-8 shadow-neu-outer animate-in fade-in zoom-in-95">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-xl font-bold font-display text-text-main">
+                    Start Bill Session
+                  </h3>
+                  <p className="text-xs text-text-secondary">
+                    Group: <strong>{group.name}</strong>
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => setIsStartSessionModalOpen(false)}
+                  className="flex h-8 w-8 items-center justify-center rounded-xl bg-card text-text-secondary hover:text-text-main shadow-neu-sm"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <form onSubmit={handleLaunchSession} className="flex flex-col gap-4">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold text-text-secondary">
+                    Session Name / Event <span className="text-danger">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={sessionName}
+                    onChange={(e) => setSessionName(e.target.value)}
+                    placeholder="e.g. Sunday Brunch, Weekend Dinner, Pizza Night"
+                    required
+                    autoFocus
+                    className="rounded-2xl border-none bg-card p-3.5 text-sm shadow-neu-inner outline-none transition-all focus:shadow-neu-inner-sm"
+                  />
+                  <p className="text-[11px] text-text-secondary">
+                    Every session has its own name so you can easily reference it later.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-bold text-text-secondary">
+                      Restaurant / Venue
+                    </label>
+                    <input
+                      type="text"
+                      value={sessionRestaurant}
+                      onChange={(e) => setSessionRestaurant(e.target.value)}
+                      placeholder="e.g. Cafe Mocha"
+                      className="rounded-2xl border-none bg-card p-3 text-xs shadow-neu-inner outline-none"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-bold text-text-secondary">
+                      Table / Note
+                    </label>
+                    <input
+                      type="text"
+                      value={sessionTable}
+                      onChange={(e) => setSessionTable(e.target.value)}
+                      placeholder="e.g. Table 12"
+                      className="rounded-2xl border-none bg-card p-3 text-xs shadow-neu-inner outline-none"
+                    />
+                  </div>
+                </div>
+
+                {/* Who is attending this meal? */}
+                {members.length > 0 && (
+                  <div className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-inner">
+                    <div className="flex items-center justify-between text-xs font-bold text-text-secondary">
+                      <span>Attending this session ({selectedAttendeeIds.size}/{members.length}):</span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedAttendeeIds(new Set(members.map((m) => m.id)))}
+                        className="text-primary hover:underline text-[11px]"
+                      >
+                        Select All
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {members.map((m) => {
+                        const isSelected = selectedAttendeeIds.has(m.id);
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedAttendeeIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(m.id)) next.delete(m.id);
+                                else next.add(m.id);
+                                return next;
+                              });
+                            }}
+                            className={`rounded-xl px-2.5 py-1 text-xs font-semibold transition-all ${
+                              isSelected
+                                ? 'bg-primary text-white shadow-neu-inner-sm'
+                                : 'bg-card text-text-secondary shadow-neu-sm'
+                            }`}
+                          >
+                            {m.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsStartSessionModalOpen(false)}
+                    className="flex-1 rounded-2xl bg-card py-3.5 text-xs font-semibold text-text-secondary shadow-neu-sm hover:text-text-main"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={startingSession || !sessionName.trim()}
+                    className="flex-1 flex items-center justify-center gap-2 rounded-2xl bg-primary py-3.5 text-sm font-bold text-white shadow-neu-sm hover:bg-primary-hover disabled:opacity-50"
+                  >
+                    <Play className="h-4 w-4 fill-current" />
+                    {startingSession ? 'Launching...' : 'Launch Session'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
       </div>
     </Layout>
   );

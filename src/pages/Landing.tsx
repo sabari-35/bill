@@ -34,10 +34,10 @@ export default function Landing() {
       {/* Top Navbar */}
       <header className="px-6 py-5 flex items-center justify-between max-w-6xl mx-auto w-full">
         <div className="flex items-center gap-2.5">
-          <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary text-white font-bold font-display text-lg shadow-neu-sm">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-primary text-white font-brand text-2xl font-bold shadow-neu-sm">
             SB
           </div>
-          <span className="text-2xl font-bold tracking-tight text-primary font-display">
+          <span className="font-brand text-3xl font-bold tracking-wide text-primary">
             SplitBill
           </span>
         </div>

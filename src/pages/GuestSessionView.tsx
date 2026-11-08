@@ -45,6 +45,7 @@ interface ItemAllocation {
   id: string;
   item_id: string;
   participant_id: string;
+  quantity: number;
   allocated_amount: number;
 }
 
@@ -59,11 +60,20 @@ interface Item {
 export default function GuestSessionView() {
   const { sessionId } = useParams<{ sessionId: string }>();
 
-  const [session, setSession] = useState<SessionData | null>(null);
+  // Instant cache retrieval to prevent reload 404 or momentary blank screens
+  const [session, setSession] = useState<SessionData | null>(() => {
+    try {
+      const cached = sessionStorage.getItem(`splitbill_guest_cache_${sessionId}`);
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
+
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [allocations, setAllocations] = useState<ItemAllocation[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!session);
   const [error, setError] = useState<string | null>(null);
 
   // Selected diner
@@ -74,47 +84,43 @@ export default function GuestSessionView() {
   const [hostUpi] = useState<string>(() => {
     return localStorage.getItem('splitbill_host_upi') || 'host@upi';
   });
+
   const [hasNotifiedPaid, setHasNotifiedPaid] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const loadGuestData = useCallback(async () => {
     if (!sessionId) return;
     try {
-      setLoading(true);
+      if (!session) setLoading(true);
       setError(null);
 
-      // Public read of session
-      const { data: sessData, error: sessErr } = await supabase
-        .from('sessions')
-        .select('*, groups(name)')
-        .eq('id', sessionId)
-        .single();
+      // Super-fast parallel fetching
+      const [sessRes, partRes, itemsRes] = await Promise.all([
+        supabase.from('sessions').select('*, groups(name)').eq('id', sessionId).single(),
+        supabase.from('session_participants').select('*, group_members(id, name, phone)').eq('session_id', sessionId),
+        supabase.from('items').select('*').eq('session_id', sessionId).order('created_at', { ascending: true })
+      ]);
 
-      if (sessErr) throw sessErr;
-      setSession(sessData);
+      if (sessRes.error) throw sessRes.error;
+      setSession(sessRes.data);
+      sessionStorage.setItem(`splitbill_guest_cache_${sessionId}`, JSON.stringify(sessRes.data));
 
-      // Public read of participants
-      const { data: partData, error: partErr } = await supabase
-        .from('session_participants')
-        .select('*, group_members(id, name, phone)')
-        .eq('session_id', sessionId);
+      if (partRes.error) throw partRes.error;
+      const partList = partRes.data || [];
+      setParticipants(partList);
 
-      if (partErr) throw partErr;
-      setParticipants(partData || []);
+      // Auto-select first participant if none selected
+      if (!selectedParticipantId && partList.length > 0) {
+        setSelectedParticipantId(partList[0].id);
+      }
 
-      // Public read of items
-      const { data: itemsData, error: itemsErr } = await supabase
-        .from('items')
-        .select('*')
-        .eq('session_id', sessionId)
-        .order('created_at', { ascending: true });
+      if (itemsRes.error) throw itemsRes.error;
+      const itemsList = itemsRes.data || [];
+      setItems(itemsList);
 
-      if (itemsErr) throw itemsErr;
-      setItems(itemsData || []);
-
-      // Public read of allocations
-      if (itemsData && itemsData.length > 0) {
-        const itemIds = itemsData.map((i) => i.id);
+      // Allocations
+      if (itemsList.length > 0) {
+        const itemIds = itemsList.map((i) => i.id);
         const { data: allocData, error: allocErr } = await supabase
           .from('item_allocations')
           .select('*')
@@ -126,11 +132,13 @@ export default function GuestSessionView() {
       }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'Failed to load bill session');
+      if (!session) {
+        setError(err.message || 'Failed to load bill session');
+      }
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, session, selectedParticipantId]);
 
   useEffect(() => {
     loadGuestData();
@@ -151,31 +159,48 @@ export default function GuestSessionView() {
     return map;
   }, [allocations]);
 
-  // Total bill calculations
   const totalSubtotal = useMemo(() => {
     return items.reduce((sum, item) => sum + (item.total_price || 0), 0);
   }, [items]);
 
   const grandTotal = session?.grand_total || totalSubtotal;
 
-  // Breakdown for each participant
+  // Breakdown for each participant based on strict consumption
   const participantBreakdown = useMemo(() => {
-    const map = new Map<string, { baseAmount: number; totalOwed: number; itemsList: { name: string; amount: number }[] }>();
+    const map = new Map<
+      string,
+      { 
+        baseAmount: number; 
+        totalOwed: number; 
+        taxShare: number;
+        itemsList: { name: string; amount: number; portion: number; splitCount: number }[] 
+      }
+    >();
 
     for (const p of participants) {
-      map.set(p.id, { baseAmount: 0, totalOwed: 0, itemsList: [] });
+      map.set(p.id, { baseAmount: 0, totalOwed: 0, taxShare: 0, itemsList: [] });
     }
 
     for (const item of items) {
       const itemAllocs = allocationsByItem.get(item.id) || [];
-      if (itemAllocs.length > 0) {
-        const splitAmount = Math.round(item.total_price / itemAllocs.length);
-        for (const alloc of itemAllocs) {
-          const cur = map.get(alloc.participant_id) || { baseAmount: 0, totalOwed: 0, itemsList: [] };
-          cur.baseAmount += splitAmount;
-          cur.itemsList.push({ name: item.name, amount: splitAmount });
-          map.set(alloc.participant_id, cur);
-        }
+      if (itemAllocs.length === 0) continue;
+
+      const totalPortions = itemAllocs.reduce((sum, a) => sum + (a.quantity || 1), 0);
+      if (totalPortions <= 0) continue;
+
+      for (const alloc of itemAllocs) {
+        const pPortion = alloc.quantity || 1;
+        const splitAmount = Math.round((item.total_price * pPortion) / totalPortions);
+
+        const cur = map.get(alloc.participant_id) || { baseAmount: 0, totalOwed: 0, taxShare: 0, itemsList: [] };
+        cur.baseAmount += splitAmount;
+        cur.itemsList.push({ 
+          name: item.name, 
+          amount: splitAmount, 
+          portion: pPortion,
+          splitCount: itemAllocs.length 
+        });
+        map.set(alloc.participant_id, cur);
       }
     }
 
@@ -185,13 +210,13 @@ export default function GuestSessionView() {
     const discount = session?.discount || 0;
 
     for (const p of participants) {
-      const cur = map.get(p.id) || { baseAmount: 0, totalOwed: 0, itemsList: [] };
+      const cur = map.get(p.id) || { baseAmount: 0, totalOwed: 0, taxShare: 0, itemsList: [] };
       if (totalSubtotal > 0 && cur.baseAmount > 0) {
         const ratio = cur.baseAmount / totalSubtotal;
-        const pTax = Math.round(taxTotal * ratio);
+        cur.taxShare = Math.round(taxTotal * ratio);
         const pService = Math.round(serviceCharge * ratio);
         const pDiscount = Math.round(discount * ratio);
-        cur.totalOwed = Math.max(0, cur.baseAmount + pTax + pService - pDiscount);
+        cur.totalOwed = Math.max(0, cur.baseAmount + cur.taxShare + pService - pDiscount);
       } else {
         cur.totalOwed = cur.baseAmount;
       }
@@ -218,8 +243,9 @@ export default function GuestSessionView() {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background p-6">
         <div className="flex flex-col items-center gap-3">
-          <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent" />
-          <p className="text-text-secondary font-medium">Loading restaurant bill...</p>
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-primary border-t-transparent shadow-neu-sm" />
+          <span className="font-brand text-2xl font-bold text-primary">SplitBill</span>
+          <p className="text-text-secondary text-xs">Loading live restaurant check...</p>
         </div>
       </div>
     );
@@ -231,8 +257,8 @@ export default function GuestSessionView() {
         <div className="flex flex-col items-center justify-center gap-4 rounded-3xl bg-card p-10 text-center shadow-neu-outer max-w-md">
           <AlertCircle className="h-12 w-12 text-danger" />
           <h2 className="text-2xl font-bold font-display text-text-main">Bill Not Found</h2>
-          <p className="text-text-secondary">{error || 'This bill session could not be found.'}</p>
-          <Link to="/" className="rounded-2xl bg-primary px-6 py-3 font-semibold text-white shadow-neu-sm">
+          <p className="text-text-secondary text-xs">{error || 'This bill session could not be found or has ended.'}</p>
+          <Link to="/" className="rounded-2xl bg-primary px-6 py-3 font-semibold text-white shadow-neu-sm text-sm">
             Go to SplitBill
           </Link>
         </div>
@@ -260,16 +286,15 @@ export default function GuestSessionView() {
       )}
 
       {/* Header Banner */}
-      <header className="sticky top-0 z-40 glass-overlay shadow-neu-sm px-6 py-4 flex items-center justify-between rounded-b-3xl">
+      <header className="sticky top-0 z-40 glass-overlay shadow-neu-sm px-6 py-3.5 flex items-center justify-between rounded-b-3xl">
         <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-white font-bold font-display text-sm">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-white font-brand text-xl font-bold shadow-neu-sm">
             SB
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight text-primary font-display leading-tight">
+            <h1 className="font-brand text-2xl font-bold text-primary leading-tight">
               SplitBill
             </h1>
-            <span className="text-[11px] text-text-secondary">Guest Settlement</span>
           </div>
         </div>
 
@@ -281,13 +306,13 @@ export default function GuestSessionView() {
         </Link>
       </header>
 
-      <main className="mx-auto max-w-2xl px-4 pt-6 flex flex-col gap-6">
+      <main className="mx-auto max-w-xl px-4 pt-5 flex flex-col gap-5">
 
         {/* Bill Overview Card */}
-        <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-3">
+        <div className="rounded-3xl bg-card p-5 sm:p-6 shadow-neu-outer flex flex-col gap-3">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-2xl font-bold font-display text-text-main">
+              <h2 className="text-xl sm:text-2xl font-bold font-display text-text-main">
                 {session.restaurant_name || 'Restaurant Bill'}
               </h2>
               <p className="text-xs text-text-secondary flex items-center gap-1.5 mt-0.5">
@@ -316,16 +341,16 @@ export default function GuestSessionView() {
         </div>
 
         {/* Diner Selector: "Who are you?" */}
-        <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-3">
+        <div className="rounded-3xl bg-card p-5 shadow-neu-outer flex flex-col gap-2.5">
           <label className="text-sm font-bold text-text-main font-display flex items-center gap-2">
             <Users className="h-4 w-4 text-primary" />
             Who are you at the table?
           </label>
-          <p className="text-xs text-text-secondary">
-            Select your name to see your personal share and pay instantly:
+          <p className="text-[11px] text-text-secondary">
+            Select your name to view your individual share and pay instantly:
           </p>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 pt-1">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
             {participants.map((p) => {
               const isSelected = p.id === selectedParticipantId;
               const isPaid = p.status === 'PAID';
@@ -360,10 +385,10 @@ export default function GuestSessionView() {
 
         {/* Selected Diner Share & UPI Payment Card */}
         {selectedParticipant && selectedBreakdown && (
-          <div className="rounded-3xl bg-card p-6 sm:p-8 shadow-neu-outer flex flex-col gap-6 animate-in fade-in">
+          <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-5 animate-in fade-in">
             <div className="flex items-center justify-between">
               <div>
-                <span className="text-xs text-text-secondary uppercase tracking-wider font-semibold">
+                <span className="text-[10px] text-text-secondary uppercase tracking-wider font-bold">
                   Your Personal Share
                 </span>
                 <h3 className="text-xl font-bold font-display text-text-main">
@@ -385,24 +410,32 @@ export default function GuestSessionView() {
 
             {/* Dishes Consumed */}
             <div className="flex flex-col gap-2 rounded-2xl bg-card p-4 shadow-neu-inner text-xs">
-              <span className="font-bold text-text-main">Dishes you shared:</span>
+              <span className="font-bold text-text-main">Dishes you consumed:</span>
               {selectedBreakdown.itemsList.length === 0 ? (
-                <span className="text-text-secondary">No specific dishes assigned.</span>
+                <span className="text-text-secondary italic">No specific dishes assigned.</span>
               ) : (
                 <div className="flex flex-col gap-1.5 divide-y divide-text-secondary/10">
                   {selectedBreakdown.itemsList.map((dish, idx) => (
                     <div key={idx} className="flex justify-between pt-1 text-text-secondary">
-                      <span>{dish.name}</span>
+                      <span>
+                        {dish.name} {dish.portion > 1 ? `(${dish.portion} portions)` : (dish.splitCount > 1 ? `(1/${dish.splitCount} share)` : '')}
+                      </span>
                       <span className="font-semibold text-text-main">{formatCurrency(dish.amount)}</span>
                     </div>
                   ))}
+                  {selectedBreakdown.taxShare > 0 && (
+                    <div className="flex justify-between pt-1 text-text-secondary">
+                      <span>Proportional Tax (GST):</span>
+                      <span className="font-semibold text-text-main">+{formatCurrency(selectedBreakdown.taxShare)}</span>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
             {/* UPI QR Code and Pay Button */}
             {selectedParticipant.status !== 'PAID' && (
-              <div className="flex flex-col items-center gap-4 pt-2">
+              <div className="flex flex-col items-center gap-4 pt-1">
                 <div className="p-4 rounded-2xl bg-white shadow-neu-inner">
                   <img
                     src={getQrCodeImageUrl(upiUrl, 200)}
@@ -418,7 +451,7 @@ export default function GuestSessionView() {
                 <div className="flex flex-col w-full gap-2.5">
                   <a
                     href={upiUrl}
-                    className="flex items-center justify-center gap-2 rounded-2xl bg-primary py-4 text-base font-bold text-white shadow-neu-sm hover:bg-primary-hover"
+                    className="flex items-center justify-center gap-2 rounded-2xl bg-primary py-4 text-base font-bold text-white shadow-neu-sm hover:bg-primary-hover transition-all"
                   >
                     Pay via UPI App ({formatCurrency(owesPaise)})
                   </a>
@@ -437,9 +470,9 @@ export default function GuestSessionView() {
           </div>
         )}
 
-        {/* Full Bill Breakdown Collapsible */}
-        <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-4">
-          <h3 className="text-base font-bold font-display text-text-main flex items-center justify-between">
+        {/* Full Bill Breakdown */}
+        <div className="rounded-3xl bg-card p-5 shadow-neu-outer flex flex-col gap-3">
+          <h3 className="text-sm font-bold font-display text-text-main flex items-center justify-between">
             <span className="flex items-center gap-2">
               <Receipt className="h-4 w-4 text-primary" />
               Complete Table Items ({items.length})
