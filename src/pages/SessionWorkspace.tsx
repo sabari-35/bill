@@ -968,7 +968,6 @@ export default function SessionWorkspace() {
                 <div className="flex flex-col gap-4">
                   {items.map((item) => {
                     const itemAllocs = allocationsByItem.get(item.id) || [];
-                    const assignedParticipantIds = new Set(itemAllocs.map((a) => a.participant_id));
                     const totalPortions = itemAllocs.reduce((s, a) => s + (a.quantity || 1), 0);
 
                     return (
