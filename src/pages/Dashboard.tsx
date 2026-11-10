@@ -13,6 +13,7 @@ import {
   Plus,
   Sparkles,
   TrendingUp,
+  BarChart3,
   X
 } from 'lucide-react';
 
@@ -155,6 +156,8 @@ export default function Dashboard() {
             status: 'DRAFT',
             subtotal: 0,
             grand_total: 0,
+            tax_percent: 5.0,
+            host_upi_id: 'host@upi',
           },
         ])
         .select()
@@ -215,7 +218,7 @@ export default function Dashboard() {
         </div>
 
         {/* Performance Metrics Summary Bar */}
-        <div className="grid grid-cols-3 gap-3 sm:gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
           <div className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer flex flex-col gap-1">
             <div className="flex items-center gap-2 text-text-secondary text-xs font-semibold">
               <Users className="h-4 w-4 text-primary" />
@@ -239,12 +242,33 @@ export default function Dashboard() {
           <div className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer flex flex-col gap-1">
             <div className="flex items-center gap-2 text-text-secondary text-xs font-semibold">
               <TrendingUp className="h-4 w-4 text-success" />
-              <span>Total Settled</span>
+              <span>Total Billed</span>
             </div>
             <span className="text-lg sm:text-2xl font-bold font-display text-primary truncate">
               {formatCurrency(totalAmountSettled)}
             </span>
           </div>
+
+          <Link
+            to="/analytics"
+            className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer hover:shadow-neu-inner transition-all flex flex-col justify-between gap-1 group border border-primary/20"
+          >
+            <div className="flex items-center justify-between text-xs font-semibold text-primary">
+              <span className="flex items-center gap-1.5">
+                <BarChart3 className="h-4 w-4" />
+                Ledger
+              </span>
+              <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+            </div>
+            <div>
+              <span className="text-sm sm:text-base font-bold font-display text-text-main group-hover:text-primary transition-colors block">
+                Settlements →
+              </span>
+              <span className="text-[10px] text-text-secondary font-medium block">
+                Track each person
+              </span>
+            </div>
+          </Link>
         </div>
 
         {/* Groups Listing (Hierarchy: Groups -> Nested Sessions) */}

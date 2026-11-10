@@ -77,13 +77,9 @@ export default function GuestSessionView() {
   const [error, setError] = useState<string | null>(null);
 
   // Selected diner
-  const [selectedParticipantId, setSelectedParticipantId] = useState<string>(() => {
-    return localStorage.getItem(`splitbill_guest_${sessionId}`) || '';
-  });
+  const [selectedParticipantId, setSelectedParticipantId] = useState<string>('');
 
-  const [hostUpi] = useState<string>(() => {
-    return localStorage.getItem('splitbill_host_upi') || 'host@upi';
-  });
+  const [hostUpi, setHostUpi] = useState<string>('host@upi');
 
   const [hasNotifiedPaid, setHasNotifiedPaid] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -102,8 +98,12 @@ export default function GuestSessionView() {
       ]);
 
       if (sessRes.error) throw sessRes.error;
-      setSession(sessRes.data);
-      sessionStorage.setItem(`splitbill_guest_cache_${sessionId}`, JSON.stringify(sessRes.data));
+      const sData = sessRes.data;
+      setSession(sData);
+      sessionStorage.setItem(`splitbill_guest_cache_${sessionId}`, JSON.stringify(sData));
+      if (sData.host_upi_id) {
+        setHostUpi(sData.host_upi_id);
+      }
 
       if (partRes.error) throw partRes.error;
       const partList = partRes.data || [];
@@ -231,12 +231,40 @@ export default function GuestSessionView() {
 
   const handleSelectParticipant = (id: string) => {
     setSelectedParticipantId(id);
-    localStorage.setItem(`splitbill_guest_${sessionId}`, id);
   };
 
-  const handleNotifyPaid = () => {
+  const handleNotifyPaid = async () => {
+    if (!selectedParticipant || !sessionId) return;
     setHasNotifiedPaid(true);
-    showToast('Payment notification sent to Host! 🎉');
+
+    try {
+      // 1. Update participant status to PAID in database
+      await supabase
+        .from('session_participants')
+        .update({ status: 'PAID' })
+        .eq('id', selectedParticipant.id);
+
+      // 2. Persist in payments table in database
+      await supabase
+        .from('payments')
+        .upsert({
+          session_id: sessionId,
+          participant_id: selectedParticipant.id,
+          amount: owesPaise,
+          currency: 'INR',
+          status: 'SUCCESS',
+          paid_at: new Date().toISOString(),
+        }, { onConflict: 'session_id,participant_id' });
+
+      setParticipants((prev) =>
+        prev.map((p) => (p.id === selectedParticipant.id ? { ...p, status: 'PAID' } : p))
+      );
+
+      showToast('Payment recorded in database & host notified! 🎉');
+    } catch (e: any) {
+      console.warn('Failed to persist payment status in DB', e);
+      showToast('Payment notification sent to Host! 🎉');
+    }
   };
 
   if (loading) {

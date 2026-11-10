@@ -224,6 +224,8 @@ export default function CreateSession() {
             status: 'DRAFT',
             subtotal: 0,
             grand_total: 0,
+            tax_percent: 5.0,
+            host_upi_id: 'host@upi',
           },
         ])
         .select()

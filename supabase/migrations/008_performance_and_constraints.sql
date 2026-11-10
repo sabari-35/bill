@@ -47,3 +47,4 @@ BEGIN
     ALTER TABLE item_allocations ADD CONSTRAINT chk_alloc_amount_positive CHECK (allocated_amount >= 0);
   END IF;
 END $$;
+

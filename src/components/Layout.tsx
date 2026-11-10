@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
-import { useNavigate, Link } from 'react-router-dom';
-import { LogOut } from 'lucide-react';
+import { useNavigate, Link, useLocation } from 'react-router-dom';
+import { LogOut, BarChart3, LayoutDashboard } from 'lucide-react';
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
+  const location = useLocation();
   const [user, setUser] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
@@ -78,13 +79,39 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           </span>
         </Link>
 
-        <div className="flex items-center gap-3">
-          <span className="hidden sm:inline-block text-xs font-semibold text-text-secondary bg-card px-3 py-1.5 rounded-xl shadow-neu-inner">
+        <div className="flex items-center gap-2">
+          <Link
+            to="/dashboard"
+            className={`flex items-center gap-1.5 rounded-xl px-2.5 sm:px-3 py-1.5 text-xs font-bold transition-all ${
+              location.pathname === '/dashboard'
+                ? 'bg-card shadow-neu-inner text-primary'
+                : 'text-text-secondary hover:text-text-main hover:shadow-neu-inner-sm'
+            }`}
+          >
+            <LayoutDashboard className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Dashboard</span>
+          </Link>
+
+          <Link
+            to="/analytics"
+            className={`flex items-center gap-1.5 rounded-xl px-2.5 sm:px-3 py-1.5 text-xs font-bold transition-all ${
+              location.pathname === '/analytics' || location.pathname === '/settlements'
+                ? 'bg-card shadow-neu-inner text-primary'
+                : 'text-text-secondary hover:text-text-main hover:shadow-neu-inner-sm'
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Analytics</span>
+          </Link>
+        </div>
+
+        <div className="flex items-center gap-2 sm:gap-3">
+          <span className="hidden md:inline-block text-xs font-semibold text-text-secondary bg-card px-3 py-1.5 rounded-xl shadow-neu-inner">
             {user.user_metadata?.name || user.email?.split('@')[0]}
           </span>
           <button
             onClick={handleLogout}
-            className="flex items-center gap-1.5 rounded-xl bg-card px-3.5 py-2 text-xs font-semibold text-text-secondary shadow-neu-sm transition-all hover:shadow-neu-inner-sm hover:text-danger"
+            className="flex items-center gap-1.5 rounded-xl bg-card px-3 py-2 text-xs font-semibold text-text-secondary shadow-neu-sm transition-all hover:shadow-neu-inner-sm hover:text-danger"
             title="Log out"
           >
             <LogOut className="h-3.5 w-3.5" />

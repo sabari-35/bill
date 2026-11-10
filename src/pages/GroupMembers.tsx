@@ -14,13 +14,20 @@ import {
   Calendar, 
   AlertCircle,
   CheckCircle2,
+  Clock,
   Phone,
   Edit2,
   Check,
   X,
   BookOpen,
-  Plus
+  Plus,
+  BarChart3,
+  ChevronRight,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
+import { fetchGroupAnalytics, type GroupAnalytics, type MemberSettlementSummary } from '../lib/analytics';
+import { generateUpiUrl } from '../lib/utils';
 
 interface Group {
   id: string;
@@ -63,6 +70,11 @@ export default function GroupMembers() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Group Analytics & Settlement states
+  const [groupAnalytics, setGroupAnalytics] = useState<GroupAnalytics | null>(null);
+  const [expandedMemberIds, setExpandedMemberIds] = useState<Set<string>>(new Set());
+  const [hostUpi, setHostUpi] = useState<string>('host@upi');
 
   // New member form
   const [memberName, setMemberName] = useState('');
@@ -126,9 +138,20 @@ export default function GroupMembers() {
       if (sessionsError) throw sessionsError;
       setSessions(sessionsData || []);
 
+      // Load group settlement analytics & host profile
+      try {
+        const analytics = await fetchGroupAnalytics(groupId);
+        setGroupAnalytics(analytics);
+      } catch (aErr) {
+        console.warn('Failed to calculate group analytics:', aErr);
+      }
+
       // Pull other frequent friends across groups to enable 1-click add
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
+        const { data: profile } = await supabase.from('profiles').select('upi_id').eq('id', user.id).single();
+        if (profile?.upi_id) setHostUpi(profile.upi_id);
+
         const { data: allMembersData } = await supabase
           .from('group_members')
           .select('name, phone')
@@ -228,6 +251,84 @@ export default function GroupMembers() {
     } finally {
       setAddingMember(false);
     }
+  };
+
+  const toggleMemberExpand = (memberId: string) => {
+    setExpandedMemberIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(memberId)) next.delete(memberId);
+      else next.add(memberId);
+      return next;
+    });
+  };
+
+  const handleToggleMemberSessionPayment = async (
+    participantId: string,
+    currentStatusPaid: boolean,
+    sessionId: string,
+    shareAmount: number
+  ) => {
+    const newStatus = currentStatusPaid ? 'JOINED' : 'PAID';
+    try {
+      await supabase
+        .from('session_participants')
+        .update({ status: newStatus })
+        .eq('id', participantId);
+
+      if (newStatus === 'PAID') {
+        await supabase
+          .from('payments')
+          .upsert({
+            session_id: sessionId,
+            participant_id: participantId,
+            amount: shareAmount,
+            currency: 'INR',
+            status: 'SUCCESS',
+            paid_at: new Date().toISOString(),
+          }, { onConflict: 'session_id,participant_id' });
+      } else {
+        await supabase
+          .from('payments')
+          .update({ status: 'CANCELLED' })
+          .eq('session_id', sessionId)
+          .eq('participant_id', participantId);
+      }
+
+      await fetchGroupDetails();
+      showNotification('Payment status updated! ✅');
+    } catch (err: any) {
+      alert(`Error updating payment: ${err.message}`);
+    }
+  };
+
+  const handleSendMemberWhatsAppReminder = (memberSummary: MemberSettlementSummary) => {
+    const pendingSessions = memberSummary.sessions.filter((s) => !s.isPaid);
+    if (pendingSessions.length === 0) {
+      handleSendWhatsAppGreeting({ 
+        id: memberSummary.memberId, 
+        name: memberSummary.name, 
+        phone: memberSummary.phone, 
+        group_id: groupId || '', 
+        status: 'JOINED', 
+        created_at: '' 
+      });
+      return;
+    }
+
+    let msg = `Hi *${memberSummary.name}*! 👋\n\n`;
+    msg += `Here is your pending bill settlement for *${group?.name || 'our group'}*:\n\n`;
+
+    pendingSessions.forEach((s) => {
+      msg += `• *${s.sessionRestaurant}*: ${formatCurrency(s.shareAmount)} ⏳\n`;
+    });
+
+    msg += `\n*Total Pending: ${formatCurrency(memberSummary.totalPending)}*\n\n`;
+    msg += `You can pay via UPI to: *${hostUpi}*\n`;
+    msg += `UPI Link: ${generateUpiUrl({ upiId: hostUpi, amountInRupees: memberSummary.totalPending / 100, payeeName: 'SplitBill Settlement' })}\n\n`;
+    msg += `Thanks! 🍽️`;
+
+    const url = generateWhatsAppUrl({ phone: memberSummary.phone, message: msg });
+    window.open(url, '_blank');
   };
 
   const handleAddFrequentFriend = async (friend: { name: string; phone: string | null }) => {
@@ -448,6 +549,75 @@ export default function GroupMembers() {
           </button>
         </div>
 
+        {/* Group Analytics Overview Cards */}
+        {groupAnalytics && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4">
+            {/* Total Spent in this Group */}
+            <div className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer flex flex-col gap-1">
+              <div className="flex items-center gap-2 text-text-secondary text-xs font-semibold">
+                <Receipt className="h-4 w-4 text-primary" />
+                <span>Group Spent</span>
+              </div>
+              <span className="text-xl sm:text-2xl font-bold font-display text-text-main truncate">
+                {formatCurrency(groupAnalytics.totalSpent)}
+              </span>
+              <span className="text-[10px] text-text-secondary">
+                {groupAnalytics.sessionsCount} session(s)
+              </span>
+            </div>
+
+            {/* Total Settled in this Group */}
+            <div className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer flex flex-col gap-1">
+              <div className="flex items-center gap-2 text-text-secondary text-xs font-semibold">
+                <CheckCircle2 className="h-4 w-4 text-success" />
+                <span>Settled</span>
+              </div>
+              <span className="text-xl sm:text-2xl font-bold font-display text-success truncate">
+                {formatCurrency(groupAnalytics.totalSettled)}
+              </span>
+              <span className="text-[10px] text-success/80 font-bold">
+                {groupAnalytics.settlementRate}% collected
+              </span>
+            </div>
+
+            {/* Total Pending in this Group */}
+            <div className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer flex flex-col gap-1">
+              <div className="flex items-center gap-2 text-text-secondary text-xs font-semibold">
+                <Clock className="h-4 w-4 text-warning" />
+                <span>Need to Settle</span>
+              </div>
+              <span className="text-xl sm:text-2xl font-bold font-display text-warning truncate">
+                {formatCurrency(groupAnalytics.totalPending)}
+              </span>
+              <span className="text-[10px] text-text-secondary">
+                Remaining to collect
+              </span>
+            </div>
+
+            {/* Link to Full Overall Analytics Page */}
+            <Link
+              to="/analytics"
+              className="rounded-2xl sm:rounded-3xl bg-card p-4 sm:p-5 shadow-neu-outer hover:shadow-neu-inner transition-all flex flex-col justify-between gap-1 group border border-primary/20"
+            >
+              <div className="flex items-center justify-between text-xs font-semibold text-primary">
+                <span className="flex items-center gap-1.5">
+                  <BarChart3 className="h-4 w-4" />
+                  Full Ledger
+                </span>
+                <ChevronRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+              </div>
+              <div>
+                <span className="text-xs sm:text-sm font-bold font-display text-text-main group-hover:text-primary transition-colors block">
+                  Overall Analytics →
+                </span>
+                <span className="text-[10px] text-text-secondary font-medium block">
+                  All circles & diners
+                </span>
+              </div>
+            </Link>
+          </div>
+        )}
+
         {/* Members Management Section */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           
@@ -491,105 +661,212 @@ export default function GroupMembers() {
                   </p>
                 </div>
               ) : (
-                <div className="flex flex-col gap-3 max-h-[460px] overflow-y-auto pr-1">
-                  {members.map((member, index) => (
-                    <div
-                      key={member.id}
-                      className="flex items-center justify-between rounded-2xl bg-card p-3.5 px-4 shadow-neu-sm transition-all hover:shadow-neu-inner-sm"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/40 font-bold text-primary font-brand text-xl">
-                          {member.name.charAt(0).toUpperCase()}
-                        </div>
-                        <div>
-                          <div className="font-semibold text-text-main flex items-center gap-2">
-                            <span>{member.name}</span>
-                            {index === 0 && (
-                              <span className="rounded-lg bg-primary/15 px-2 py-0.5 text-[10px] font-bold text-primary">
-                                Initial
-                              </span>
-                            )}
-                          </div>
+                <div className="flex flex-col gap-3 max-h-[560px] overflow-y-auto pr-1">
+                  {members.map((member, index) => {
+                    const memberSummary = groupAnalytics?.members.find((m) => m.memberId === member.id);
+                    const isExpanded = expandedMemberIds.has(member.id);
+                    const owes = memberSummary?.totalPending || 0;
+                    const isFullySettled = owes <= 0 && (memberSummary?.totalBilled || 0) > 0;
 
-                          {/* Phone number display & edit */}
-                          {editingMemberId === member.id ? (
-                            <div className="flex items-center gap-2 mt-1">
-                              <input
-                                type="tel"
-                                value={editingPhoneValue}
-                                onChange={(e) => setEditingPhoneValue(e.target.value)}
-                                placeholder="WhatsApp (e.g. 9876543210)"
-                                className="rounded-xl border-none bg-card p-1.5 px-2.5 text-xs shadow-neu-inner outline-none w-44 font-sans"
-                                autoFocus
-                              />
-                              <button
-                                onClick={() => handleSavePhone(member.id)}
-                                className="flex h-7 w-7 items-center justify-center rounded-lg bg-success text-white hover:opacity-90"
-                                title="Save phone"
-                              >
-                                <Check className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                onClick={() => setEditingMemberId(null)}
-                                className="flex h-7 w-7 items-center justify-center rounded-lg bg-card text-text-secondary hover:text-text-main shadow-neu-sm"
-                                title="Cancel"
-                              >
-                                <X className="h-3.5 w-3.5" />
-                              </button>
+                    return (
+                      <div
+                        key={member.id}
+                        className="flex flex-col gap-2.5 rounded-2xl bg-card p-3.5 px-4 shadow-neu-sm transition-all hover:shadow-neu-inner-sm overflow-hidden"
+                      >
+                        {/* Member Header Row */}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3 min-w-0 flex-1">
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/40 font-bold text-primary font-brand text-xl">
+                              {member.name.charAt(0).toUpperCase()}
                             </div>
-                          ) : (
-                            <div className="flex items-center gap-2 text-xs text-text-secondary mt-0.5">
-                              {member.phone ? (
-                                <>
-                                  <span className="flex items-center gap-1 font-medium text-text-main">
-                                    <Phone className="h-3 w-3 text-success" />
-                                    {member.phone}
+                            <div className="min-w-0">
+                              <div className="font-semibold text-text-main flex items-center gap-2">
+                                <span className="truncate">{member.name}</span>
+                                {index === 0 && (
+                                  <span className="rounded-lg bg-primary/15 px-2 py-0.5 text-[10px] font-bold text-primary shrink-0">
+                                    Initial
                                   </span>
+                                )}
+                              </div>
+
+                              {/* Phone number display & edit */}
+                              {editingMemberId === member.id ? (
+                                <div className="flex items-center gap-2 mt-1">
+                                  <input
+                                    type="tel"
+                                    value={editingPhoneValue}
+                                    onChange={(e) => setEditingPhoneValue(e.target.value)}
+                                    placeholder="WhatsApp (e.g. 9876543210)"
+                                    className="rounded-xl border-none bg-card p-1.5 px-2.5 text-xs shadow-neu-inner outline-none w-44 font-sans"
+                                    autoFocus
+                                  />
                                   <button
-                                    onClick={() => handleSendWhatsAppGreeting(member)}
-                                    className="flex items-center gap-1 text-[11px] font-semibold text-success hover:underline"
-                                    title="Open WhatsApp chat"
+                                    onClick={() => handleSavePhone(member.id)}
+                                    className="flex h-7 w-7 items-center justify-center rounded-lg bg-success text-white hover:opacity-90"
+                                    title="Save phone"
                                   >
-                                    <WhatsAppIcon className="h-3 w-3 text-[#25D366]" />
-                                    WhatsApp
+                                    <Check className="h-3.5 w-3.5" />
                                   </button>
                                   <button
-                                    onClick={() => {
-                                      setEditingMemberId(member.id);
-                                      setEditingPhoneValue(member.phone || '');
-                                    }}
-                                    className="text-text-secondary hover:text-primary"
-                                    title="Edit WhatsApp number"
+                                    onClick={() => setEditingMemberId(null)}
+                                    className="flex h-7 w-7 items-center justify-center rounded-lg bg-card text-text-secondary hover:text-text-main shadow-neu-sm"
+                                    title="Cancel"
                                   >
-                                    <Edit2 className="h-3 w-3" />
+                                    <X className="h-3.5 w-3.5" />
                                   </button>
-                                </>
+                                </div>
                               ) : (
-                                <button
-                                  onClick={() => {
-                                    setEditingMemberId(member.id);
-                                    setEditingPhoneValue('');
-                                  }}
-                                  className="flex items-center gap-1 text-[11px] font-semibold text-primary hover:underline"
-                                >
-                                  <Phone className="h-3 w-3" />
-                                  + Add Phone
-                                </button>
+                                <div className="flex items-center gap-2 text-xs text-text-secondary mt-0.5">
+                                  {member.phone ? (
+                                    <>
+                                      <span className="flex items-center gap-1 font-medium text-text-main truncate">
+                                        <Phone className="h-3 w-3 text-success shrink-0" />
+                                        {member.phone}
+                                      </span>
+                                      <button
+                                        onClick={() => {
+                                          if (memberSummary && owes > 0) {
+                                            handleSendMemberWhatsAppReminder(memberSummary);
+                                          } else {
+                                            handleSendWhatsAppGreeting(member);
+                                          }
+                                        }}
+                                        className="flex items-center gap-1 text-[11px] font-semibold text-success hover:underline shrink-0"
+                                        title={owes > 0 ? 'Send pending bill summary' : 'Open WhatsApp chat'}
+                                      >
+                                        <WhatsAppIcon className="h-3 w-3 text-[#25D366]" />
+                                        WhatsApp
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          setEditingMemberId(member.id);
+                                          setEditingPhoneValue(member.phone || '');
+                                        }}
+                                        className="text-text-secondary hover:text-primary shrink-0"
+                                        title="Edit WhatsApp number"
+                                      >
+                                        <Edit2 className="h-3 w-3" />
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      onClick={() => {
+                                        setEditingMemberId(member.id);
+                                        setEditingPhoneValue('');
+                                      }}
+                                      className="flex items-center gap-1 text-[11px] font-semibold text-primary hover:underline"
+                                    >
+                                      <Phone className="h-3 w-3" />
+                                      + Add Phone
+                                    </button>
+                                  )}
+                                </div>
                               )}
                             </div>
-                          )}
-                        </div>
-                      </div>
+                          </div>
 
-                      <button
-                        onClick={() => handleRemoveMember(member.id, member.name)}
-                        className="flex h-9 w-9 items-center justify-center rounded-xl text-text-secondary hover:text-danger hover:bg-danger/10 transition-colors"
-                        title="Remove member"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </div>
-                  ))}
+                          {/* Settlement Status & Action Buttons */}
+                          <div className="flex items-center gap-2 shrink-0">
+                            {/* Settlement Status Pill */}
+                            <div className="text-right">
+                              {owes > 0 ? (
+                                <span className="rounded-xl px-2.5 py-1 text-xs font-bold bg-warning/15 text-warning border border-warning/30 inline-block font-display">
+                                  Owes {formatCurrency(owes)} ⏳
+                                </span>
+                              ) : isFullySettled ? (
+                                <span className="rounded-xl px-2.5 py-1 text-xs font-bold bg-success/15 text-success border border-success/30 inline-block">
+                                  Settled ✅
+                                </span>
+                              ) : (
+                                <span className="text-[11px] text-text-secondary font-medium">
+                                  No bills
+                                </span>
+                              )}
+                            </div>
+
+                            {/* Expand bill session breakdown */}
+                            {memberSummary && memberSummary.sessions.length > 0 && (
+                              <button
+                                onClick={() => toggleMemberExpand(member.id)}
+                                className="flex h-8 w-8 items-center justify-center rounded-xl bg-card shadow-neu-sm hover:shadow-neu-inner text-text-secondary"
+                                title="View bill sessions"
+                              >
+                                {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                              </button>
+                            )}
+
+                            {/* Remove Member */}
+                            <button
+                              onClick={() => handleRemoveMember(member.id, member.name)}
+                              className="flex h-8 w-8 items-center justify-center rounded-xl text-text-secondary hover:text-danger hover:bg-danger/10 transition-colors"
+                              title="Remove member"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Expandable Session Breakdown */}
+                        {isExpanded && memberSummary && (
+                          <div className="pt-2.5 border-t border-text-secondary/10 flex flex-col gap-2 animate-in fade-in">
+                            <div className="flex items-center justify-between text-[11px] text-text-secondary font-semibold">
+                              <span>
+                                Billed in {memberSummary.sessions.length} session(s) • Total: {formatCurrency(memberSummary.totalBilled)}
+                              </span>
+                              <span className="text-success font-bold">
+                                Settled: {formatCurrency(memberSummary.totalSettled)}
+                              </span>
+                            </div>
+
+                            <div className="flex flex-col gap-1.5">
+                              {memberSummary.sessions.map((sess) => (
+                                <div
+                                  key={sess.sessionId}
+                                  className="flex items-center justify-between rounded-xl bg-card p-2 px-3 shadow-neu-inner text-xs"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <Link
+                                      to={`/sessions/${sess.sessionId}`}
+                                      className="font-bold text-text-main hover:text-primary transition-colors truncate block"
+                                    >
+                                      {sess.sessionRestaurant}
+                                    </Link>
+                                    <span className="text-[10px] text-text-secondary">
+                                      {new Date(sess.sessionDate).toLocaleDateString()}
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-2.5 shrink-0">
+                                    <span className="font-bold text-primary font-display">
+                                      {formatCurrency(sess.shareAmount)}
+                                    </span>
+
+                                    <button
+                                      onClick={() =>
+                                        handleToggleMemberSessionPayment(
+                                          sess.participantId,
+                                          sess.isPaid,
+                                          sess.sessionId,
+                                          sess.shareAmount
+                                        )
+                                      }
+                                      className={`rounded-lg px-2 py-0.5 text-[11px] font-bold shadow-neu-sm transition-all ${
+                                        sess.isPaid
+                                          ? 'bg-success text-white hover:bg-success/90'
+                                          : 'bg-card text-warning shadow-neu-inner hover:bg-warning/15'
+                                      }`}
+                                    >
+                                      {sess.isPaid ? 'Paid ✅' : 'Paid?'}
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

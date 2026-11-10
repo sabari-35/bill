@@ -9,6 +9,7 @@ import CreateSession from './pages/CreateSession';
 import SessionWorkspace from './pages/SessionWorkspace';
 import GuestSessionView from './pages/GuestSessionView';
 import JoinBill from './pages/JoinBill';
+import Analytics from './pages/Analytics';
 import NotFound from './pages/NotFound';
 
 function App() {
@@ -30,6 +31,10 @@ function App() {
         <Route path="/sessions/:sessionId" element={<SessionWorkspace />} />
         <Route path="/sessions/:sessionId/view" element={<GuestSessionView />} />
         
+        {/* Analytics & Settlements */}
+        <Route path="/analytics" element={<Analytics />} />
+        <Route path="/settlements" element={<Analytics />} />
+
         {/* Guest Join & Fallback */}
         <Route path="/join" element={<JoinBill />} />
         <Route path="*" element={<NotFound />} />

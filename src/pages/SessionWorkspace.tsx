@@ -42,10 +42,12 @@ interface SessionData {
   status: string;
   subtotal: number; // in paise
   tax_total: number;
+  tax_percent?: number;
   service_charge: number;
   discount: number;
   round_off: number;
   grand_total: number;
+  host_upi_id?: string | null;
   created_at: string;
   groups?: {
     name: string;
@@ -112,15 +114,13 @@ export default function SessionWorkspace() {
   const [loading, setLoading] = useState(!session);
   const [error, setError] = useState<string | null>(null);
 
-  // Additional Charges state
+  // Additional Charges state (fully synced with database)
   const [taxPercent, setTaxPercent] = useState<number>(5);
   const [serviceChargeRupees, setServiceChargeRupees] = useState<number>(0);
   const [discountRupees, setDiscountRupees] = useState<number>(0);
 
-  // Host UPI configuration
-  const [hostUpiId, setHostUpiId] = useState<string>(() => {
-    return localStorage.getItem('splitbill_host_upi') || 'host@upi';
-  });
+  // Host UPI configuration (fully stored in database)
+  const [hostUpiId, setHostUpiId] = useState<string>('host@upi');
 
   // Modal states
   const [isAddItemOpen, setIsAddItemOpen] = useState(false);
@@ -167,8 +167,23 @@ export default function SessionWorkspace() {
       ]);
 
       if (sessRes.error) throw sessRes.error;
-      setSession(sessRes.data);
-      sessionStorage.setItem(`splitbill_cache_sess_${sessionId}`, JSON.stringify(sessRes.data));
+      const sessData = sessRes.data;
+      setSession(sessData);
+      sessionStorage.setItem(`splitbill_cache_sess_${sessionId}`, JSON.stringify(sessData));
+
+      // Restore all financial settings & host UPI directly from database
+      if (sessData.tax_percent !== undefined && sessData.tax_percent !== null) {
+        setTaxPercent(Number(sessData.tax_percent));
+      }
+      if (sessData.service_charge !== undefined && sessData.service_charge !== null) {
+        setServiceChargeRupees(Number(sessData.service_charge) / 100);
+      }
+      if (sessData.discount !== undefined && sessData.discount !== null) {
+        setDiscountRupees(Number(sessData.discount) / 100);
+      }
+      if (sessData.host_upi_id) {
+        setHostUpiId(sessData.host_upi_id);
+      }
 
       if (partRes.error) throw partRes.error;
       setParticipants(partRes.data || []);
@@ -343,7 +358,7 @@ export default function SessionWorkspace() {
     return breakdown;
   }, [participants, items, allocationsByItem, calculatedSubtotal, calculatedTaxTotal, calculatedServiceCharge, calculatedDiscount]);
 
-  // Sync totals to DB
+  // Sync totals and financial configuration strictly to DB
   const syncSessionTotals = useCallback(async () => {
     if (!sessionId) return;
     try {
@@ -352,21 +367,76 @@ export default function SessionWorkspace() {
         .update({
           subtotal: calculatedSubtotal,
           tax_total: calculatedTaxTotal,
+          tax_percent: taxPercent,
           service_charge: calculatedServiceCharge,
           discount: calculatedDiscount,
           grand_total: calculatedGrandTotal,
+          host_upi_id: hostUpiId,
         })
         .eq('id', sessionId);
     } catch (e) {
       console.warn('Could not sync session totals to DB', e);
     }
-  }, [sessionId, calculatedSubtotal, calculatedTaxTotal, calculatedServiceCharge, calculatedDiscount, calculatedGrandTotal]);
+  }, [sessionId, calculatedSubtotal, calculatedTaxTotal, taxPercent, calculatedServiceCharge, calculatedDiscount, calculatedGrandTotal, hostUpiId]);
 
   useEffect(() => {
     if (session) {
       syncSessionTotals();
     }
   }, [syncSessionTotals, session]);
+
+  // Direct DB update handlers for real-time persistence
+  const handleUpdateHostUpi = async (val: string) => {
+    setHostUpiId(val);
+    if (!sessionId) return;
+    try {
+      await supabase
+        .from('sessions')
+        .update({ host_upi_id: val.trim() })
+        .eq('id', sessionId);
+    } catch (e) {
+      console.warn('Failed to update host UPI in DB', e);
+    }
+  };
+
+  const handleTaxPercentChange = async (val: number) => {
+    setTaxPercent(val);
+    if (!sessionId) return;
+    try {
+      await supabase
+        .from('sessions')
+        .update({ tax_percent: val })
+        .eq('id', sessionId);
+    } catch (e) {
+      console.warn('Failed to update tax_percent in DB', e);
+    }
+  };
+
+  const handleServiceChargeChange = async (val: number) => {
+    setServiceChargeRupees(val);
+    if (!sessionId) return;
+    try {
+      await supabase
+        .from('sessions')
+        .update({ service_charge: toPaise(val) })
+        .eq('id', sessionId);
+    } catch (e) {
+      console.warn('Failed to update service_charge in DB', e);
+    }
+  };
+
+  const handleDiscountChange = async (val: number) => {
+    setDiscountRupees(val);
+    if (!sessionId) return;
+    try {
+      await supabase
+        .from('sessions')
+        .update({ discount: toPaise(val) })
+        .eq('id', sessionId);
+    } catch (e) {
+      console.warn('Failed to update discount in DB', e);
+    }
+  };
 
   // Generate personalized WhatsApp message for a diner
   const getPersonalWhatsAppMessage = useCallback((p: Participant) => {
@@ -683,17 +753,41 @@ export default function SessionWorkspace() {
     }
   };
 
-  // Toggle payment status (PAID / UNPAID)
+  // Toggle payment status (PAID / UNPAID) - persisted to both session_participants and payments tables
   const handleTogglePaymentStatus = async (participant: Participant) => {
     const newStatus = participant.status === 'PAID' ? 'JOINED' : 'PAID';
 
     try {
+      // 1. Update status in session_participants
       const { error } = await supabase
         .from('session_participants')
         .update({ status: newStatus })
         .eq('id', participant.id);
 
       if (error) throw error;
+
+      // 2. Persist record in payments table
+      if (sessionId) {
+        const owes = participantBreakdown.get(participant.id)?.totalOwed || 0;
+        if (newStatus === 'PAID') {
+          await supabase
+            .from('payments')
+            .upsert({
+              session_id: sessionId,
+              participant_id: participant.id,
+              amount: owes,
+              currency: 'INR',
+              status: 'SUCCESS',
+              paid_at: new Date().toISOString(),
+            }, { onConflict: 'session_id,participant_id' });
+        } else {
+          await supabase
+            .from('payments')
+            .update({ status: 'CANCELLED' })
+            .eq('session_id', sessionId)
+            .eq('participant_id', participant.id);
+        }
+      }
 
       setParticipants((prev) =>
         prev.map((p) => (p.id === participant.id ? { ...p, status: newStatus } : p))
@@ -1081,7 +1175,7 @@ export default function SessionWorkspace() {
                       min="0"
                       max="30"
                       value={taxPercent}
-                      onChange={(e) => setTaxPercent(parseFloat(e.target.value) || 0)}
+                      onChange={(e) => handleTaxPercentChange(parseFloat(e.target.value) || 0)}
                       className="w-full rounded-2xl border-none bg-card p-3 shadow-neu-inner outline-none text-sm font-bold"
                     />
                     <span className="text-sm font-semibold text-text-secondary">%</span>
@@ -1100,7 +1194,7 @@ export default function SessionWorkspace() {
                     type="number"
                     min="0"
                     value={serviceChargeRupees}
-                    onChange={(e) => setServiceChargeRupees(parseFloat(e.target.value) || 0)}
+                    onChange={(e) => handleServiceChargeChange(parseFloat(e.target.value) || 0)}
                     placeholder="0"
                     className="w-full rounded-2xl border-none bg-card p-3 shadow-neu-inner outline-none text-sm font-bold"
                   />
@@ -1118,7 +1212,7 @@ export default function SessionWorkspace() {
                     type="number"
                     min="0"
                     value={discountRupees}
-                    onChange={(e) => setDiscountRupees(parseFloat(e.target.value) || 0)}
+                    onChange={(e) => handleDiscountChange(parseFloat(e.target.value) || 0)}
                     placeholder="0"
                     className="w-full rounded-2xl border-none bg-card p-3 shadow-neu-inner outline-none text-sm font-bold text-success"
                   />
@@ -1169,7 +1263,7 @@ export default function SessionWorkspace() {
             </div>
 
             {/* Individual Breakdown & Settle Status */}
-            <div className="rounded-3xl bg-card p-6 shadow-neu-outer flex flex-col gap-4">
+            <div className="rounded-3xl bg-card p-5 sm:p-6 shadow-neu-outer flex flex-col gap-4">
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-bold font-display text-text-main">
                   Who Owes What
@@ -1189,57 +1283,88 @@ export default function SessionWorkspace() {
                   return (
                     <div
                       key={p.id}
-                      className="flex flex-col gap-2 rounded-2xl bg-card p-3.5 shadow-neu-sm"
+                      className="flex flex-col gap-2.5 rounded-2xl bg-card p-3.5 sm:p-4 shadow-neu-sm overflow-hidden transition-all hover:shadow-neu-inner-sm"
                     >
-                      <div className="flex items-center justify-between">
-                        <div 
-                          className="cursor-pointer flex-1"
-                          onClick={() => toggleDinerBreakdown(p.id)}
-                        >
-                          <div className="font-bold text-sm text-text-main flex items-center gap-1.5">
-                            <span>{p.group_members.name}</span>
-                            {p.group_members.phone && (
-                              <span className="text-[10px] text-text-secondary font-sans">
-                                ({p.group_members.phone})
-                              </span>
-                            )}
-                            {isExpanded ? (
-                              <ChevronUp className="h-3.5 w-3.5 text-text-secondary" />
-                            ) : (
-                              <ChevronDown className="h-3.5 w-3.5 text-text-secondary" />
-                            )}
-                          </div>
-                          <div className="text-xs font-bold text-primary font-display mt-0.5">
-                            {formatCurrency(owes)}
-                          </div>
+                      {/* Top Row: Diner Name & Total Owed (never clipped or overflowing) */}
+                      <div 
+                        className="flex items-center justify-between gap-2 cursor-pointer select-none"
+                        onClick={() => toggleDinerBreakdown(p.id)}
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-bold text-sm text-text-main truncate max-w-[140px] sm:max-w-[200px]">
+                            {p.group_members.name}
+                          </span>
+                          {p.group_members.phone && (
+                            <span className="text-[10px] text-text-secondary font-sans truncate">
+                              ({p.group_members.phone})
+                            </span>
+                          )}
+                          {isExpanded ? (
+                            <ChevronUp className="h-3.5 w-3.5 text-text-secondary shrink-0" />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5 text-text-secondary shrink-0" />
+                          )}
                         </div>
+                        <div className="text-sm font-bold text-primary font-display shrink-0">
+                          {formatCurrency(owes)}
+                        </div>
+                      </div>
 
-                        <div className="flex items-center gap-1.5">
+                      {/* Bottom Row: Status Badge & Quick Action Buttons */}
+                      <div className="flex items-center justify-between gap-2 pt-2 border-t border-text-secondary/10">
+                        <span
+                          className={`text-[10px] font-semibold px-2 py-0.5 rounded-lg inline-flex items-center gap-1 shrink-0 ${
+                            isPaid ? 'bg-success/15 text-success' : 'bg-warning/15 text-warning'
+                          }`}
+                        >
+                          {isPaid ? (
+                            <>
+                              <Check className="h-3 w-3 stroke-[3]" />
+                              <span>Paid</span>
+                            </>
+                          ) : (
+                            <span>⏳ Unpaid</span>
+                          )}
+                        </span>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
                           {/* Pay QR button */}
                           <button
-                            onClick={() => setActivePaymentParticipant(p)}
-                            className="flex h-8 w-8 items-center justify-center rounded-xl bg-card shadow-neu-inner text-primary hover:text-primary-hover"
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActivePaymentParticipant(p);
+                            }}
+                            className="flex h-7 w-7 items-center justify-center rounded-xl bg-card shadow-neu-inner text-primary hover:text-primary-hover transition-colors shrink-0"
                             title="View UPI QR"
                           >
-                            <QrCode className="h-4 w-4" />
+                            <QrCode className="h-3.5 w-3.5" />
                           </button>
 
                           {/* Direct WhatsApp button */}
                           <button
-                            onClick={() => handleDirectWhatsAppSend(p)}
-                            className="flex items-center gap-1 rounded-xl bg-card px-2.5 py-1.5 text-xs font-bold text-success shadow-neu-sm hover:shadow-neu-inner-sm transition-all border border-success/30"
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDirectWhatsAppSend(p);
+                            }}
+                            className="flex items-center gap-1 rounded-xl bg-card px-2.5 py-1 text-xs font-bold text-success shadow-neu-sm hover:shadow-neu-inner-sm transition-all border border-success/30 shrink-0"
                             title={p.group_members.phone ? `WhatsApp ${p.group_members.phone}` : 'Enter phone & send'}
                           >
                             <WhatsAppIcon className="h-3.5 w-3.5 text-[#25D366]" />
-                            <span>WhatsApp</span>
+                            <span className="text-[11px]">WhatsApp</span>
                           </button>
 
                           {/* Mark Paid Toggle */}
                           <button
-                            onClick={() => handleTogglePaymentStatus(p)}
-                            className={`rounded-xl px-2.5 py-1.5 text-xs font-bold transition-all ${
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleTogglePaymentStatus(p);
+                            }}
+                            className={`rounded-xl px-2.5 py-1 text-xs font-bold transition-all shrink-0 ${
                               isPaid
-                                ? 'bg-success text-white shadow-neu-sm'
+                                ? 'bg-success text-white shadow-neu-sm hover:bg-success/90'
                                 : 'bg-card text-warning shadow-neu-inner hover:bg-warning/10'
                             }`}
                           >
@@ -1284,7 +1409,7 @@ export default function SessionWorkspace() {
             </div>
 
             {/* Host UPI Setting */}
-            <div className="rounded-3xl bg-card p-6 shadow-neu-inner flex flex-col gap-2">
+            <div className="rounded-3xl bg-card p-5 sm:p-6 shadow-neu-inner flex flex-col gap-2.5">
               <label className="text-xs font-bold text-text-main flex items-center gap-1.5">
                 <DollarSign className="h-3.5 w-3.5 text-primary" />
                 Host Receiving UPI ID:
@@ -1292,15 +1417,12 @@ export default function SessionWorkspace() {
               <input
                 type="text"
                 value={hostUpiId}
-                onChange={(e) => {
-                  setHostUpiId(e.target.value);
-                  localStorage.setItem('splitbill_host_upi', e.target.value);
-                }}
+                onChange={(e) => handleUpdateHostUpi(e.target.value)}
                 placeholder="yourname@okhdfcbank"
-                className="w-full rounded-2xl border-none bg-card p-3 text-xs shadow-neu-outer outline-none font-semibold text-text-main"
+                className="w-full rounded-2xl border-none bg-card p-3 text-xs shadow-neu-outer outline-none font-semibold text-text-main focus:ring-1 focus:ring-primary/40 transition-all"
               />
-              <span className="text-[10px] text-text-secondary">
-                Included in every WhatsApp message & UPI QR code for diners to pay you.
+              <span className="text-[11px] text-text-secondary leading-relaxed">
+                Stored directly in database. Included in every WhatsApp message & UPI QR code for diners to pay you.
               </span>
             </div>
 
