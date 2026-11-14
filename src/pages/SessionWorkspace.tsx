@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import Layout from '../components/Layout';
@@ -114,13 +114,61 @@ export default function SessionWorkspace() {
   const [loading, setLoading] = useState(!session);
   const [error, setError] = useState<string | null>(null);
 
-  // Additional Charges state (fully synced with database)
-  const [taxPercent, setTaxPercent] = useState<number>(5);
-  const [serviceChargeRupees, setServiceChargeRupees] = useState<number>(0);
-  const [discountRupees, setDiscountRupees] = useState<number>(0);
+  // Guard: prevent syncSessionTotals from overwriting DB with default state
+  // until loadSessionData has restored real values from DB at least once.
+  const dbLoadedRef = useRef(false);
 
-  // Host UPI configuration (fully stored in database)
-  const [hostUpiId, setHostUpiId] = useState<string>('host@upi');
+  // Additional Charges state (initialized from cache if available, else fallback)
+  const [taxPercent, setTaxPercent] = useState<number>(() => {
+    try {
+      const cached = sessionStorage.getItem(`splitbill_cache_sess_${sessionId}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed.tax_percent !== undefined && parsed.tax_percent !== null) {
+          return Number(parsed.tax_percent);
+        }
+      }
+    } catch {}
+    return 5;
+  });
+  const [serviceChargeRupees, setServiceChargeRupees] = useState<number>(() => {
+    try {
+      const cached = sessionStorage.getItem(`splitbill_cache_sess_${sessionId}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed.service_charge !== undefined && parsed.service_charge !== null) {
+          return Number(parsed.service_charge) / 100;
+        }
+      }
+    } catch {}
+    return 0;
+  });
+  const [discountRupees, setDiscountRupees] = useState<number>(() => {
+    try {
+      const cached = sessionStorage.getItem(`splitbill_cache_sess_${sessionId}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed.discount !== undefined && parsed.discount !== null) {
+          return Number(parsed.discount) / 100;
+        }
+      }
+    } catch {}
+    return 0;
+  });
+
+  // Host UPI configuration (initialized from cache if available, else fallback)
+  const [hostUpiId, setHostUpiId] = useState<string>(() => {
+    try {
+      const cached = sessionStorage.getItem(`splitbill_cache_sess_${sessionId}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed.host_upi_id) {
+          return parsed.host_upi_id;
+        }
+      }
+    } catch {}
+    return 'host@upi';
+  });
 
   // Modal states
   const [isAddItemOpen, setIsAddItemOpen] = useState(false);
@@ -184,6 +232,7 @@ export default function SessionWorkspace() {
       if (sessData.host_upi_id) {
         setHostUpiId(sessData.host_upi_id);
       }
+      dbLoadedRef.current = true;
 
       if (partRes.error) throw partRes.error;
       setParticipants(partRes.data || []);
@@ -360,7 +409,7 @@ export default function SessionWorkspace() {
 
   // Sync totals and financial configuration strictly to DB
   const syncSessionTotals = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || !dbLoadedRef.current) return;
     try {
       await supabase
         .from('sessions')
@@ -380,7 +429,7 @@ export default function SessionWorkspace() {
   }, [sessionId, calculatedSubtotal, calculatedTaxTotal, taxPercent, calculatedServiceCharge, calculatedDiscount, calculatedGrandTotal, hostUpiId]);
 
   useEffect(() => {
-    if (session) {
+    if (session && dbLoadedRef.current) {
       syncSessionTotals();
     }
   }, [syncSessionTotals, session]);
